@@ -521,9 +521,14 @@ export async function handleVkInbound(params: {
             runtime.log?.(`vk: status-reaction clear failed: ${String(err)}`);
           }
         })();
-      } else {
-        void statusReactions.restoreInitial();
       }
+      // NB: we intentionally do NOT call statusReactions.restoreInitial()
+      // here. The Discord/bundled flow uses restoreInitial after setDone
+      // to peel away intermediate reactions on platforms that support a
+      // stack of reactions. VK lets the bot keep at most one reaction
+      // per message, so setDone/setError already *replaced* the previous
+      // emoji — calling restoreInitial would just overwrite the final
+      // state with the initial "queued" emoji again (👍 instead of 🎉).
     }
   }
 }

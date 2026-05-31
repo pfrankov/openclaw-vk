@@ -17,6 +17,7 @@ import type { ResolvedVkAccount } from "./types.js";
  */
 export const VK_DEFAULT_STATUS_REACTION_EMOJIS: Required<StatusReactionEmojis> = {
   ...DEFAULT_EMOJIS,
+  // 🎉 (id=16) marks the terminal "done" so it stands out from queued 👍.
   queued: "👍",
   thinking: "🤔",
   tool: "👌",
@@ -25,11 +26,11 @@ export const VK_DEFAULT_STATUS_REACTION_EMOJIS: Required<StatusReactionEmojis> =
   deploy: "🔥",
   build: "👌",
   concierge: "👌",
-  done: "👍",
+  done: "🎉",
   error: "😡",
   stallSoft: "🤔",
   stallHard: "⁉️",
-  compacting: "🤔",
+  compacting: "🙏",
 };
 
 export type VkStatusReactionParams = {

@@ -60,13 +60,9 @@ describe("VK_DEFAULT_STATUS_REACTION_EMOJIS", () => {
     }
   });
 
-  it("uses distinct emojis for the key states", () => {
+  it("uses distinct emojis for the key states (queued/thinking/tool/done/error)", () => {
     const { queued, thinking, tool, done, error } = VK_DEFAULT_STATUS_REACTION_EMOJIS;
-    expect(new Set([thinking, tool, error]).size).toBe(3);
-    // queued and done may collide on 👍 — that's intentional (both are the
-    // happy-path bookends and VK doesn't have a perfect ✅ analogue).
-    expect(queued).toBeDefined();
-    expect(done).toBeDefined();
+    expect(new Set([queued, thinking, tool, done, error]).size).toBe(5);
   });
 });
 
