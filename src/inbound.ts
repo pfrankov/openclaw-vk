@@ -446,6 +446,14 @@ export async function handleVkInbound(params: {
   await startTypingOnce();
 
   let dispatchError = false;
+  // Defensive guard mirroring the bundled channels' isProcessAborted() check
+  // (see core message-handler.process / telegram bot). VK has no abortSignal in
+  // this scope, so we use a local "settled" flag: once the turn finalizes
+  // (setDone/setError in finally), late-arriving progress callbacks become
+  // no-ops. The SDK controller already guards on `finished`, so this is
+  // belt-and-suspenders — but it keeps intent explicit and avoids redundant
+  // setReaction churn after the turn is done.
+  let turnSettled = false;
   try {
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -478,16 +486,28 @@ export async function handleVkInbound(params: {
         onModelSelected,
         ...(statusReactions
           ? {
+              // Without these, the core gates onToolStart/onCompactionStart
+              // behind tool-summary visibility (requiresToolSummaryVisibility),
+              // so the 👌/🙏 reactions never fire in DMs even though
+              // onReasoningStream (🤔) does. These flags enable the "quiet
+              // direct native progress" path: reaction callbacks run without
+              // emitting default tool-progress text messages.
+              suppressDefaultToolProgressMessages: true,
+              allowProgressCallbacksWhenSourceDeliverySuppressed: true,
               onReasoningStream: async () => {
+                if (turnSettled) return;
                 await statusReactions!.setThinking();
               },
               onToolStart: async (payload: { name?: string }) => {
+                if (turnSettled) return;
                 await statusReactions!.setTool(payload?.name);
               },
               onCompactionStart: async () => {
+                if (turnSettled) return;
                 await statusReactions!.setCompacting();
               },
               onCompactionEnd: async () => {
+                if (turnSettled) return;
                 statusReactions!.cancelPending();
                 await statusReactions!.setThinking();
               },
@@ -499,6 +519,7 @@ export async function handleVkInbound(params: {
     dispatchError = true;
     throw err;
   } finally {
+    turnSettled = true;
     if (statusReactions) {
       try {
         if (dispatchError) {
