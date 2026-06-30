@@ -49,9 +49,17 @@ export type VkInboundMessage = {
   timestamp: number;
   isGroup: boolean;
   messagePayload?: unknown;
+  geo?: VkInboundGeo;
   attachments?: VkInboundAttachment[];
   replyToMessageId?: string;
   replyToText?: string;
+};
+
+export type VkInboundGeo = {
+  latitude: number;
+  longitude: number;
+  placeTitle?: string;
+  city?: string;
 };
 
 export type VkButtonStyle = "primary" | "secondary" | "success" | "danger";

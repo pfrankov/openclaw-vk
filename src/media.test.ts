@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import {
   extractVkInboundAttachments,
+  formatVkInboundGeoText,
   loadVkOutboundMedia,
   resolveVkInboundBodyText,
+  resolveVkInboundGeo,
   resolveVkInboundResolvedMedia,
   resolveVkInboundResolvedMediaPaths,
   resolveVkInboundResolvedMediaTypes,
@@ -286,6 +288,81 @@ describe("extractVkInboundAttachments", () => {
     expect(result[0].kind).toBe("image");
     expect(result[1].kind).toBe("document");
     expect(result[2].kind).toBe("audio");
+  });
+});
+
+describe("resolveVkInboundGeo", () => {
+  it("parses coordinates objects from VK geo payloads", () => {
+    expect(
+      resolveVkInboundGeo({
+        coordinates: {
+          latitude: 55.916704,
+          longitude: 37.815848,
+        },
+        place: {
+          title: "Королёв",
+          city: "Россия",
+        },
+      }),
+    ).toEqual({
+      latitude: 55.916704,
+      longitude: 37.815848,
+      placeTitle: "Королёв",
+      city: "Россия",
+    });
+  });
+
+  it('parses string coordinates in VK "lon lat" format', () => {
+    expect(
+      resolveVkInboundGeo({
+        coordinates: "37.815848 55.916704",
+      }),
+    ).toEqual({
+      latitude: 55.916704,
+      longitude: 37.815848,
+      placeTitle: undefined,
+      city: undefined,
+    });
+  });
+});
+
+describe("formatVkInboundGeoText", () => {
+  it("renders geo text with place details", () => {
+    expect(
+      formatVkInboundGeoText({
+        latitude: 55.916704,
+        longitude: 37.815848,
+        placeTitle: "Королёв",
+        city: "Россия",
+      }),
+    ).toBe("[VK location] 55.916704, 37.815848 (Королёв, Россия)");
+  });
+});
+
+describe("resolveVkInboundBodyText", () => {
+  it("returns geo text when message contains only location", () => {
+    expect(
+      resolveVkInboundBodyText({
+        geo: {
+          latitude: 55.916704,
+          longitude: 37.815848,
+          placeTitle: "Королёв",
+          city: "Россия",
+        },
+      }),
+    ).toBe("[VK location] 55.916704, 37.815848 (Королёв, Россия)");
+  });
+
+  it("appends geo text below regular text", () => {
+    expect(
+      resolveVkInboundBodyText({
+        text: "Проба",
+        geo: {
+          latitude: 55.916704,
+          longitude: 37.815848,
+        },
+      }),
+    ).toBe("Проба\n\n[VK location] 55.916704, 37.815848");
   });
 });
 

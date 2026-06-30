@@ -4,6 +4,8 @@ import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
+  resolveVkInboundBodyText,
+  resolveVkInboundGeo,
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
@@ -17,6 +19,137 @@ export type VkMonitorOptions = {
   runtime: RuntimeEnv;
   abortSignal?: AbortSignal;
 };
+
+type VkApiMessagePayload = {
+  id?: number;
+  conversation_message_id?: number;
+  from_id?: number;
+  date?: number;
+  text?: string;
+  attachments?: unknown[];
+  geo?: unknown;
+  reply_message?: unknown;
+  payload?: unknown;
+};
+
+function resolveVkContextGeo(context: {
+  geo?: unknown;
+  message?: { geo?: unknown } | undefined;
+  payload?: { message?: { geo?: unknown } | undefined } | undefined;
+}): unknown {
+  return context.geo ?? context.message?.geo ?? context.payload?.message?.geo;
+}
+
+function isVkContextHydrated(context: { $filled?: unknown }): boolean {
+  return context.$filled === true;
+}
+
+function shouldEnrichFromApi(context: {
+  $filled?: unknown;
+  geo?: unknown;
+  message?: { geo?: unknown } | undefined;
+  payload?: { message?: { geo?: unknown } | undefined } | undefined;
+}): boolean {
+  return !isVkContextHydrated(context) || resolveVkContextGeo(context) == null;
+}
+
+function resolveVkMessagePayload(rawPayload: unknown): unknown {
+  if (typeof rawPayload !== "string") {
+    return rawPayload;
+  }
+  try {
+    return JSON.parse(rawPayload);
+  } catch {
+    return rawPayload;
+  }
+}
+
+async function fetchVkApiMessagePayload(params: {
+  vk: VK;
+  context: {
+    id: number;
+    peerId: number;
+    conversationMessageId: number;
+  };
+  runtime: RuntimeEnv;
+}): Promise<VkApiMessagePayload | undefined> {
+  try {
+    const response =
+      params.context.id !== 0
+        ? await params.vk.api.messages.getById({
+            message_ids: params.context.id,
+          })
+        : await params.vk.api.messages.getByConversationMessageId({
+            peer_id: params.context.peerId,
+            conversation_message_ids: params.context.conversationMessageId,
+          });
+    return response.items[0] as VkApiMessagePayload | undefined;
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    params.runtime.log?.(
+      `vk: direct API fetch failed for peerId=${params.context.peerId} messageId=${params.context.id}: ${errorMessage}`,
+    );
+    return undefined;
+  }
+}
+
+async function fetchVkApiMessagePayloadFromHistory(params: {
+  vk: VK;
+  context: {
+    id: number;
+    peerId: number;
+    conversationMessageId: number;
+    senderId?: number;
+    text?: string;
+    createdAt?: number;
+  };
+  runtime: RuntimeEnv;
+}): Promise<VkApiMessagePayload | undefined> {
+  try {
+    const response = await params.vk.api.messages.getHistory({
+      peer_id: params.context.peerId,
+      count: 10,
+    });
+    const items = response.items as VkApiMessagePayload[] | undefined;
+    if (!Array.isArray(items) || items.length === 0) {
+      return undefined;
+    }
+    const normalizedText = params.context.text?.trim();
+    return items.find((item) => {
+      if (typeof item !== "object" || item == null) {
+        return false;
+      }
+      if (item.id === params.context.id && params.context.id !== 0) {
+        return true;
+      }
+      if (item.conversation_message_id === params.context.conversationMessageId) {
+        return true;
+      }
+      if (
+        normalizedText &&
+        item.text?.trim() === normalizedText &&
+        item.from_id === params.context.senderId
+      ) {
+        return true;
+      }
+      if (
+        typeof item.date === "number" &&
+        typeof params.context.createdAt === "number" &&
+        Math.abs(item.date - params.context.createdAt) <= 120 &&
+        item.from_id === params.context.senderId
+      ) {
+        return true;
+      }
+      return false;
+    });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    params.runtime.log?.(
+      `vk: history API fetch failed for peerId=${params.context.peerId} messageId=${params.context.id}: ${errorMessage}`,
+    );
+    return undefined;
+  }
+}
 
 /**
  * Check whether the Bots Long Poll API is accessible for this token.
@@ -98,12 +231,77 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       return;
     }
 
+    let fetchedMessage: VkApiMessagePayload | undefined;
+    if (shouldEnrichFromApi(context)) {
+      fetchedMessage = await fetchVkApiMessagePayload({
+        vk,
+        context: {
+          id: context.id,
+          peerId: context.peerId,
+          conversationMessageId: context.conversationMessageId,
+        },
+        runtime: opts.runtime,
+      });
+      if (!fetchedMessage) {
+        try {
+          await context.loadMessagePayload?.();
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          opts.runtime.log?.(
+            `vk: failed to hydrate message payload for peerId=${context.peerId} messageId=${context.id}: ${errorMessage}`,
+          );
+        }
+      }
+    }
+
+    if (!fetchedMessage?.geo) {
+      const historyMessage = await fetchVkApiMessagePayloadFromHistory({
+        vk,
+        context: {
+          id: context.id,
+          peerId: context.peerId,
+          conversationMessageId: context.conversationMessageId,
+          senderId: context.senderId,
+          text: context.text,
+          createdAt: context.createdAt,
+        },
+        runtime: opts.runtime,
+      });
+      if (historyMessage) {
+        fetchedMessage = {
+          ...historyMessage,
+          ...fetchedMessage,
+          geo: fetchedMessage?.geo ?? historyMessage.geo,
+          attachments: fetchedMessage?.attachments ?? historyMessage.attachments,
+          payload: fetchedMessage?.payload ?? historyMessage.payload,
+          reply_message: fetchedMessage?.reply_message ?? historyMessage.reply_message,
+          text: fetchedMessage?.text ?? historyMessage.text,
+        };
+      }
+    }
+
     const peerId = context.peerId;
     const senderId = context.senderId;
-    const text = context.text ?? "";
+    const text = fetchedMessage?.text ?? context.text ?? "";
     const isGroup = peerId >= 2_000_000_000;
-    const attachments = extractVkInboundAttachments(context.attachments);
-    const replyContext = resolveVkInboundReplyContext(context.replyMessage);
+    const attachments = extractVkInboundAttachments(fetchedMessage?.attachments ?? context.attachments);
+    const rawGeo = fetchedMessage?.geo ?? resolveVkContextGeo(context);
+    const geo = resolveVkInboundGeo(rawGeo);
+    opts.runtime.log?.(
+      `vk: inbound message_new peerId=${peerId} messageId=${context.id} hydrated=${isVkContextHydrated(
+        context,
+      )} hasGeo=${Boolean(context.hasGeo || rawGeo || fetchedMessage?.geo)} resolvedGeo=${Boolean(
+        geo,
+      )} textLen=${text.length} attachments=${attachments.length}`,
+    );
+    const visibleBody = resolveVkInboundBodyText({
+      text,
+      attachments,
+      geo,
+    });
+    const replyContext = resolveVkInboundReplyContext(
+      fetchedMessage?.reply_message ?? context.replyMessage,
+    );
     const createdAtSeconds =
       typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
         ? context.createdAt
@@ -111,20 +309,23 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
     const message: VkInboundMessage = {
       messageId: String(context.id),
-      conversationMessageId:
-        typeof context.conversationMessageId === "number" && Number.isFinite(context.conversationMessageId)
-          ? context.conversationMessageId
-          : undefined,
       peerId,
       senderId,
-      text,
+      text: visibleBody,
       timestamp: createdAtSeconds ? createdAtSeconds * 1000 : Date.now(),
       isGroup,
-      messagePayload: context.messagePayload,
+      messagePayload: resolveVkMessagePayload(fetchedMessage?.payload ?? context.messagePayload),
+      geo,
       attachments,
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
     };
+
+    if ((context.hasGeo || rawGeo || fetchedMessage?.geo) && !geo) {
+      opts.runtime.log?.(
+        `vk: geo present but unresolved for peerId=${peerId} messageId=${context.id}; rawGeo=${JSON.stringify(rawGeo)}`,
+      );
+    }
 
     core.channel.activity.record({
       channel: "vk",
