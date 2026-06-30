@@ -2,7 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PluginRuntime } from "openclaw/plugin-sdk";
-import type { VkInboundAttachment, VkInboundResolvedMedia } from "./types.js";
+import type { VkInboundAttachment, VkInboundGeo, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
   ".apng",
@@ -448,6 +448,80 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
   };
 }
 
+export function resolveVkInboundGeo(rawGeo: unknown): VkInboundGeo | undefined {
+  if (!rawGeo || typeof rawGeo !== "object" || Array.isArray(rawGeo)) {
+    return undefined;
+  }
+
+  const record = rawGeo as Record<string, unknown>;
+  const coordinates = record.coordinates;
+
+  let latitude: number | undefined;
+  let longitude: number | undefined;
+
+  if (coordinates && typeof coordinates === "object" && !Array.isArray(coordinates)) {
+    const coordinateRecord = coordinates as Record<string, unknown>;
+    latitude =
+      typeof coordinateRecord.latitude === "number" && Number.isFinite(coordinateRecord.latitude)
+        ? coordinateRecord.latitude
+        : undefined;
+    longitude =
+      typeof coordinateRecord.longitude === "number" && Number.isFinite(coordinateRecord.longitude)
+        ? coordinateRecord.longitude
+        : undefined;
+  } else if (typeof coordinates === "string" && coordinates.trim()) {
+    const parts = coordinates.trim().split(/[ ,]+/).filter(Boolean);
+    if (parts.length >= 2) {
+      const first = Number(parts[0]);
+      const second = Number(parts[1]);
+      if (Number.isFinite(first) && Number.isFinite(second)) {
+        // VK raw payloads commonly encode geo.coordinates as "lon lat".
+        longitude = first;
+        latitude = second;
+      }
+    }
+  }
+
+  if (
+    (latitude === undefined || longitude === undefined) &&
+    typeof record.latitude === "number" &&
+    Number.isFinite(record.latitude) &&
+    typeof record.longitude === "number" &&
+    Number.isFinite(record.longitude)
+  ) {
+    latitude = record.latitude;
+    longitude = record.longitude;
+  }
+
+  if (latitude === undefined || longitude === undefined) {
+    return undefined;
+  }
+
+  const place =
+    record.place && typeof record.place === "object" && !Array.isArray(record.place)
+      ? (record.place as Record<string, unknown>)
+      : undefined;
+
+  return {
+    latitude,
+    longitude,
+    placeTitle: readString(place ?? {}, "title"),
+    city: readString(place ?? {}, "city"),
+  };
+}
+
+export function formatVkInboundGeoText(geo: VkInboundGeo | undefined): string {
+  if (!geo) {
+    return "";
+  }
+
+  const placeParts = [geo.placeTitle?.trim(), geo.city?.trim()].filter(
+    (entry): entry is string => Boolean(entry),
+  );
+  const placeText = placeParts.length > 0 ? ` (${placeParts.join(", ")})` : "";
+  return `[VK location] ${geo.latitude}, ${geo.longitude}${placeText}`;
+}
+
 export function resolveVkInboundMediaUrls(
   attachments: readonly VkInboundAttachment[] | undefined,
 ): string[] {
@@ -603,10 +677,12 @@ export function resolveVkInboundResolvedMediaTypes(
 export function resolveVkInboundBodyText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
+  geo?: VkInboundGeo;
 }): string {
   const trimmedText = params.text?.trim() ?? "";
+  const geoText = formatVkInboundGeoText(params.geo);
   if (trimmedText) {
-    return trimmedText;
+    return geoText ? `${trimmedText}\n\n${geoText}` : trimmedText;
   }
 
   const mediaKinds = Array.from(
@@ -617,10 +693,11 @@ export function resolveVkInboundBodyText(params: {
     ),
   );
   if (mediaKinds.length === 0) {
-    return "";
+    return geoText;
   }
 
-  return `<media:${mediaKinds[0] ?? "attachment"}>`;
+  const mediaText = `<media:${mediaKinds[0] ?? "attachment"}>`;
+  return geoText ? `${mediaText}\n${geoText}` : mediaText;
 }
 
 function isHttpMediaUrl(value: string): boolean {

@@ -49,6 +49,15 @@ const mockGroupsGetById = vi.hoisted(() =>
 const mockGroupsGetLongPollServer = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ server: "lp.vk.com", key: "abc", ts: 1 }),
 );
+const mockMessagesGetById = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ items: [] }),
+);
+const mockMessagesGetByConversationMessageId = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ items: [] }),
+);
+const mockMessagesGetHistory = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ items: [] }),
+);
 
 vi.mock("vk-io", () => ({
   // Must use a regular function (not an arrow) so `new VK(...)` works.
@@ -58,6 +67,11 @@ vi.mock("vk-io", () => ({
         groups: {
           getById: mockGroupsGetById,
           getLongPollServer: mockGroupsGetLongPollServer,
+        },
+        messages: {
+          getById: mockMessagesGetById,
+          getByConversationMessageId: mockMessagesGetByConversationMessageId,
+          getHistory: mockMessagesGetHistory,
         },
       },
       updates: {
@@ -146,6 +160,9 @@ beforeEach(() => {
   mockGroupsGetLongPollServer
     .mockReset()
     .mockResolvedValue({ server: "lp.vk.com", key: "abc", ts: 1 });
+  mockMessagesGetById.mockReset().mockResolvedValue({ items: [] });
+  mockMessagesGetByConversationMessageId.mockReset().mockResolvedValue({ items: [] });
+  mockMessagesGetHistory.mockReset().mockResolvedValue({ items: [] });
   mockHandleVkInbound.mockReset().mockResolvedValue(undefined);
   mockPrimeVkGroupId.mockReset();
   setVkRuntime(makeVkRuntime());
@@ -253,6 +270,7 @@ describe("message_new handler", () => {
     await getMessageHandler()(
       makeCtx({
         id: 99,
+        conversationMessageId: 42,
         peerId: 123_456,
         senderId: 555_000,
         text: "hi",
@@ -264,6 +282,7 @@ describe("message_new handler", () => {
     const { message } = mockHandleVkInbound.mock.calls[0][0];
     expect(message).toMatchObject({
       messageId: "99",
+      conversationMessageId: 42,
       peerId: 123_456,
       senderId: 555_000,
       text: "hi",
@@ -369,6 +388,90 @@ describe("message_new handler", () => {
 
     const { message } = mockHandleVkInbound.mock.calls[0][0];
     expect(message.text).toBe("");
+  });
+
+  it("keeps location-only messages visible via geo fallback", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({
+        text: "",
+        hasGeo: true,
+        geo: {
+          coordinates: "37.815848 55.916704",
+          place: {
+            title: "Королёв",
+            city: "Россия",
+          },
+        },
+      }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.text).toBe("[VK location] 55.916704, 37.815848 (Королёв, Россия)");
+    expect(message.geo).toEqual({
+      latitude: 55.916704,
+      longitude: 37.815848,
+      placeTitle: "Королёв",
+      city: "Россия",
+    });
+  });
+
+  it("fetches geo from messages.getHistory when context itself has no geo", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    mockMessagesGetById.mockResolvedValueOnce({ items: [] });
+    mockMessagesGetHistory.mockResolvedValueOnce({
+      items: [
+        {
+          id: 42,
+          from_id: 555_000,
+          text: "",
+          geo: {
+            coordinates: "37.815848 55.916704",
+          },
+        },
+      ],
+    });
+
+    await getMessageHandler()(makeCtx({ text: "", hasGeo: true }));
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(mockMessagesGetById).toHaveBeenCalledWith({ message_ids: 42 });
+    expect(mockMessagesGetHistory).toHaveBeenCalledWith({
+      peer_id: 555_000,
+      count: 10,
+    });
+    expect(message.text).toBe("[VK location] 55.916704, 37.815848");
+    expect(message.geo).toEqual({
+      latitude: 55.916704,
+      longitude: 37.815848,
+      placeTitle: undefined,
+      city: undefined,
+    });
+  });
+
+  it("does not call geo enrichment APIs for ordinary text-only messages", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(makeCtx({ text: "just text", hasGeo: false, geo: undefined }));
+
+    expect(mockMessagesGetById).not.toHaveBeenCalled();
+    expect(mockMessagesGetByConversationMessageId).not.toHaveBeenCalled();
+    expect(mockMessagesGetHistory).not.toHaveBeenCalled();
+  });
+
+  it("preserves conversationMessageId for downstream status reactions", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(makeCtx({ conversationMessageId: 777 }));
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.conversationMessageId).toBe(777);
   });
 
   it("records inbound activity before dispatching", async () => {
