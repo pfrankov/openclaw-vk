@@ -270,6 +270,7 @@ describe("message_new handler", () => {
     await getMessageHandler()(
       makeCtx({
         id: 99,
+        conversationMessageId: 42,
         peerId: 123_456,
         senderId: 555_000,
         text: "hi",
@@ -281,6 +282,7 @@ describe("message_new handler", () => {
     const { message } = mockHandleVkInbound.mock.calls[0][0];
     expect(message).toMatchObject({
       messageId: "99",
+      conversationMessageId: 42,
       peerId: 123_456,
       senderId: 555_000,
       text: "hi",
@@ -395,6 +397,7 @@ describe("message_new handler", () => {
     await getMessageHandler()(
       makeCtx({
         text: "",
+        hasGeo: true,
         geo: {
           coordinates: "37.815848 55.916704",
           place: {
@@ -433,7 +436,7 @@ describe("message_new handler", () => {
       ],
     });
 
-    await getMessageHandler()(makeCtx({ text: "" }));
+    await getMessageHandler()(makeCtx({ text: "", hasGeo: true }));
 
     const { message } = mockHandleVkInbound.mock.calls[0][0];
     expect(mockMessagesGetById).toHaveBeenCalledWith({ message_ids: 42 });
@@ -448,6 +451,27 @@ describe("message_new handler", () => {
       placeTitle: undefined,
       city: undefined,
     });
+  });
+
+  it("does not call geo enrichment APIs for ordinary text-only messages", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(makeCtx({ text: "just text", hasGeo: false, geo: undefined }));
+
+    expect(mockMessagesGetById).not.toHaveBeenCalled();
+    expect(mockMessagesGetByConversationMessageId).not.toHaveBeenCalled();
+    expect(mockMessagesGetHistory).not.toHaveBeenCalled();
+  });
+
+  it("preserves conversationMessageId for downstream status reactions", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(makeCtx({ conversationMessageId: 777 }));
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.conversationMessageId).toBe(777);
   });
 
   it("records inbound activity before dispatching", async () => {

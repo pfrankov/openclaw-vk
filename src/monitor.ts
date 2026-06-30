@@ -53,6 +53,15 @@ function shouldEnrichFromApi(context: {
   return !isVkContextHydrated(context) || resolveVkContextGeo(context) == null;
 }
 
+function hasVkGeoSignal(context: {
+  hasGeo?: unknown;
+  geo?: unknown;
+  message?: { geo?: unknown } | undefined;
+  payload?: { message?: { geo?: unknown } | undefined } | undefined;
+}): boolean {
+  return Boolean(context.hasGeo || resolveVkContextGeo(context));
+}
+
 function resolveVkMessagePayload(rawPayload: unknown): unknown {
   if (typeof rawPayload !== "string") {
     return rawPayload;
@@ -231,8 +240,9 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       return;
     }
 
+    const geoSignalPresent = hasVkGeoSignal(context);
     let fetchedMessage: VkApiMessagePayload | undefined;
-    if (shouldEnrichFromApi(context)) {
+    if (geoSignalPresent && shouldEnrichFromApi(context)) {
       fetchedMessage = await fetchVkApiMessagePayload({
         vk,
         context: {
@@ -254,7 +264,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       }
     }
 
-    if (!fetchedMessage?.geo) {
+    if (geoSignalPresent && !fetchedMessage?.geo) {
       const historyMessage = await fetchVkApiMessagePayloadFromHistory({
         vk,
         context: {
@@ -309,6 +319,14 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
     const message: VkInboundMessage = {
       messageId: String(context.id),
+      conversationMessageId:
+        typeof context.conversationMessageId === "number" &&
+        Number.isFinite(context.conversationMessageId)
+          ? context.conversationMessageId
+          : typeof fetchedMessage?.conversation_message_id === "number" &&
+              Number.isFinite(fetchedMessage.conversation_message_id)
+            ? fetchedMessage.conversation_message_id
+            : undefined,
       peerId,
       senderId,
       text: visibleBody,
