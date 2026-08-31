@@ -1,4 +1,4 @@
-import type { RuntimeEnv } from "openclaw/plugin-sdk";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";

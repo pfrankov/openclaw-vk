@@ -2,7 +2,7 @@
 <img width="500" src="https://github.com/user-attachments/assets/1bb97849-8aa0-46dc-b3de-90e4bcf10d38"/>
 
 Плагин [OpenClaw](https://github.com/openclaw/openclaw) для работы с ВКонтакте. Подключает AI-агента к сообществам VK через Bots Long Poll API — бот принимает и отвечает на сообщения в личных диалогах и групповых беседах.  
-Минимальная требуемая версия OpenClaw: **v2026.3.28**
+Минимальная требуемая версия OpenClaw: **v2026.8.1**
 
 ## Быстрый старт
 
@@ -42,7 +42,7 @@ openclaw plugins update --all
 openclaw plugins update @openclaw-vk/vk@latest
 
 # Установить конкретную версию
-openclaw plugins install @openclaw-vk/vk@2026.4.4
+openclaw plugins install @openclaw-vk/vk@2026.8.31
 openclaw gateway restart
 openclaw channels status --json --probe
 ```

@@ -1,6 +1,6 @@
 {
   "name": "@openclaw-vk/vk",
-  "version": "2026.6.19",
+  "version": "2026.8.31",
   "description": "OpenClaw VK (VKontakte) channel plugin",
   "author": {
     "name": "Pavel Frankov",
@@ -8,6 +8,9 @@
   },
   "license": "Apache-2.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.22.3"
+  },
   "keywords": [
     "openclaw",
     "openclaw-plugin",
@@ -55,7 +58,10 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "check": "npm run check:sdk-imports && npm test && npm run build && npm run check:pack",
     "check:pack": "npm pack --dry-run",
+    "check:runtime": "node scripts/smoke-runtime.mjs",
+    "check:sdk-imports": "node scripts/check-sdk-imports.mjs",
     "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -66,6 +72,14 @@
     "vk-io": "^4.10.1",
     "zod": "^3.25.76"
   },
+  "peerDependencies": {
+    "openclaw": ">=2026.8.1-0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
   "bundleDependencies": [
     "vk-io"
   ],
@@ -75,6 +89,14 @@
     "vitest": "^3.1.1"
   },
   "openclaw": {
+    "compat": {
+      "pluginApi": ">=2026.8.1-0",
+      "minGatewayVersion": "2026.8.1"
+    },
+    "build": {
+      "openclawVersion": "2026.8.1",
+      "pluginSdkVersion": "2026.8.1"
+    },
     "extensions": [
       "./index.ts"
     ],

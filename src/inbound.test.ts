@@ -29,35 +29,57 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
-  createChannelPairingController: ({ core, channel, accountId }: Record<string, unknown>) => ({
-    readStoreForDmPolicy: () =>
-      (core as any).channel.pairing.readAllowFromStore({ channel, accountId }),
-    upsertPairingRequest: (params: Record<string, unknown>) =>
-      (core as any).channel.pairing.upsertPairingRequest({ ...params, accountId }),
-  }),
-}));
+  createChannelPairingController: ({ core, channel, accountId }: Record<string, unknown>) => {
+    const upsertPairingRequest = (params: Record<string, unknown>) =>
+      (core as any).channel.pairing.upsertPairingRequest({ channel, accountId, ...params });
 
-vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
-  issuePairingChallenge: async ({
-    upsertPairingRequest,
-    sendPairingReply,
-    senderId,
-    channel,
-    onReplyError,
-  }: Record<string, any>) => {
-    const result = await upsertPairingRequest({ channel, id: senderId });
-    if (result.created && sendPairingReply) {
-      try {
-        await sendPairingReply("pairing-reply-text");
-      } catch (err) {
-        onReplyError?.(err);
-      }
-    }
+    return {
+      readStoreForDmPolicy: (provider: string, targetAccountId: string) =>
+        (core as any).channel.pairing.readAllowFromStore({
+          channel: provider,
+          accountId: targetAccountId,
+        }),
+      upsertPairingRequest,
+      issueChallenge: async ({
+        buildReplyText,
+        meta,
+        onCreated,
+        onReplyError,
+        sendPairingReply,
+        senderId,
+        senderIdLine,
+      }: Record<string, any>) => {
+        const result = await upsertPairingRequest({ id: senderId, meta });
+        if (!result.created) {
+          return { created: false };
+        }
+
+        onCreated?.({ code: result.code });
+        const replyText =
+          buildReplyText?.({ code: result.code, senderIdLine }) ??
+          (core as any).channel.pairing.buildPairingReply({
+            channel,
+            idLine: senderIdLine,
+            code: result.code,
+          });
+        try {
+          await sendPairingReply(replyText);
+        } catch (err) {
+          onReplyError?.(err);
+        }
+        return { created: true, code: result.code };
+      },
+    };
   },
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   logInboundDrop: vi.fn(),
+  toInboundMediaFacts: (media: Array<Record<string, unknown>> = [], defaults: Record<string, unknown> = {}) =>
+    media.map((entry) => ({
+      ...entry,
+      messageId: entry.messageId ?? defaults.messageId,
+    })),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
@@ -109,14 +131,14 @@ vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   }),
 }));
 
-vi.mock("openclaw/plugin-sdk/command-auth", () => ({
+vi.mock("openclaw/plugin-sdk/command-auth-native", () => ({
   resolveControlCommandGate: vi.fn(() => ({
     shouldBlock: false,
     commandAuthorized: false,
   })),
 }));
 
-vi.mock("openclaw/plugin-sdk/config-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/runtime-group-policy", () => ({
   resolveAllowlistProviderRuntimeGroupPolicy: ({ groupPolicy }: Record<string, unknown>) => ({
     groupPolicy: groupPolicy ?? "open",
     providerMissingFallbackApplied: false,
@@ -130,7 +152,7 @@ const mockCreateReplyPrefixOptions = vi.hoisted(() => vi.fn());
 const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/channel-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
@@ -359,6 +381,38 @@ describe("DM access control", () => {
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
     expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
     expect(mockSendTypingVk).not.toHaveBeenCalled();
+  });
+
+  it("scopes pairing request and reply to a named account", async () => {
+    const accountId = "support";
+    const upsertPairingRequest = vi
+      .fn()
+      .mockResolvedValue({ code: "PAIR42", created: true });
+
+    installRuntime({ upsertPairingRequest });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({
+        accountId,
+        config: { dmPolicy: "pairing", allowFrom: [] },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(upsertPairingRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "vk",
+        accountId,
+        id: String(SENDER_ID),
+      }),
+    );
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      { text: "pairing-reply-text" },
+      { accountId },
+    );
   });
 
   it("does not re-send pairing challenge when request already exists", async () => {
@@ -941,15 +995,18 @@ describe("dispatch payload", () => {
       expect.objectContaining({
         BodyForAgent: "<media:image>",
         RawBody: "<media:image>",
-        MediaUrl: "https://example.com/photo.png",
-        MediaUrls: ["https://example.com/photo.png"],
-        MediaType: "image",
-        MediaTypes: ["image"],
+        media: [
+          expect.objectContaining({
+            url: "https://example.com/photo.png",
+            kind: "image",
+            messageId: "msg-1",
+          }),
+        ],
       }),
     );
   });
 
-  it("prefers attachment mime types in MediaType/MediaTypes when available", async () => {
+  it("preserves attachment MIME types in ordered media facts", async () => {
     const runtime = installRuntime();
 
     await handleVkInbound({
@@ -975,15 +1032,19 @@ describe("dispatch payload", () => {
       expect.objectContaining({
         BodyForAgent: "<media:image>",
         RawBody: "<media:image>",
-        MediaUrl: "https://example.com/phone-photo",
-        MediaUrls: ["https://example.com/phone-photo"],
-        MediaType: "image/heic",
-        MediaTypes: ["image/heic"],
+        media: [
+          expect.objectContaining({
+            url: "https://example.com/phone-photo",
+            contentType: "image/heic",
+            kind: "image",
+            messageId: "msg-1",
+          }),
+        ],
       }),
     );
   });
 
-  it("adds MediaPath and MediaPaths when inbound media is materialized locally", async () => {
+  it("adds the local path when inbound media is materialized", async () => {
     const runtime = installRuntime();
     vi.mocked(runtime.channel.media.fetchRemoteMedia).mockResolvedValueOnce({
       buffer: Buffer.from("heic"),
@@ -1020,17 +1081,20 @@ describe("dispatch payload", () => {
       expect.objectContaining({
         BodyForAgent: "<media:image>",
         RawBody: "<media:image>",
-        MediaPath: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
-        MediaPaths: ["/tmp/openclaw/media/inbound/IMG_0001.HEIC"],
-        MediaUrl: "https://example.com/phone-photo",
-        MediaUrls: ["https://example.com/phone-photo"],
-        MediaType: "image/heic",
-        MediaTypes: ["image/heic"],
+        media: [
+          expect.objectContaining({
+            path: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
+            url: "https://example.com/phone-photo",
+            contentType: "image/heic",
+            kind: "image",
+            messageId: "msg-1",
+          }),
+        ],
       }),
     );
   });
 
-  it("passes multiple image URLs in MediaUrls for multi-photo messages", async () => {
+  it("preserves media order for multi-photo messages", async () => {
     const runtime = installRuntime();
 
     await handleVkInbound({
@@ -1051,14 +1115,11 @@ describe("dispatch payload", () => {
 
     expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
       expect.objectContaining({
-        MediaUrl: "https://example.com/1.jpg",
-        MediaUrls: [
-          "https://example.com/1.jpg",
-          "https://example.com/2.jpg",
-          "https://example.com/3.jpg",
+        media: [
+          expect.objectContaining({ url: "https://example.com/1.jpg", kind: "image" }),
+          expect.objectContaining({ url: "https://example.com/2.jpg", kind: "image" }),
+          expect.objectContaining({ url: "https://example.com/3.jpg", kind: "image" }),
         ],
-        MediaType: "image",
-        MediaTypes: ["image"],
       }),
     );
   });
@@ -1084,15 +1145,18 @@ describe("dispatch payload", () => {
       expect.objectContaining({
         RawBody: "Look at this photo",
         BodyForAgent: "Look at this photo",
-        MediaUrl: "https://example.com/photo.jpg",
-        MediaUrls: ["https://example.com/photo.jpg"],
-        MediaType: "image",
-        MediaTypes: ["image"],
+        media: [
+          expect.objectContaining({
+            url: "https://example.com/photo.jpg",
+            kind: "image",
+            messageId: "msg-1",
+          }),
+        ],
       }),
     );
   });
 
-  it("passes mixed MediaTypes for messages with different attachment kinds", async () => {
+  it("preserves mixed attachment kinds in ordered media facts", async () => {
     const runtime = installRuntime();
 
     await handleVkInbound({
@@ -1112,15 +1176,15 @@ describe("dispatch payload", () => {
 
     expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
       expect.objectContaining({
-        MediaUrl: "https://example.com/pic.jpg",
-        MediaUrls: ["https://example.com/pic.jpg", "https://example.com/file.pdf"],
-        MediaType: "image",
-        MediaTypes: ["image", "document"],
+        media: [
+          expect.objectContaining({ url: "https://example.com/pic.jpg", kind: "image" }),
+          expect.objectContaining({ url: "https://example.com/file.pdf", kind: "document" }),
+        ],
       }),
     );
   });
 
-  it("omits MediaUrl and MediaUrls when message has no attachments", async () => {
+  it("omits media facts when message has no attachments", async () => {
     const runtime = installRuntime();
 
     await handleVkInbound({
@@ -1136,10 +1200,7 @@ describe("dispatch payload", () => {
 
     expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
       expect.objectContaining({
-        MediaUrl: undefined,
-        MediaUrls: undefined,
-        MediaType: undefined,
-        MediaTypes: undefined,
+        media: undefined,
       }),
     );
   });
@@ -1361,7 +1422,7 @@ describe("dispatch payload", () => {
 
 describe("command gating", () => {
   it("drops group message when command gate blocks unauthorized control command", async () => {
-    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth");
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth-native");
     vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
       shouldBlock: true,
       commandAuthorized: false,
@@ -1389,7 +1450,7 @@ describe("command gating", () => {
   });
 
   it("does not block DM messages even when command gate blocks", async () => {
-    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth");
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth-native");
     vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
       shouldBlock: true,
       commandAuthorized: false,

@@ -1,4 +1,5 @@
-import type { PluginRuntime, RuntimeEnv } from "openclaw/plugin-sdk";
+import type { PluginRuntime } from "openclaw/plugin-sdk/core";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { vi } from "vitest";
 import type { ResolvedVkAccount, VkInboundMessage } from "./types.js";
 

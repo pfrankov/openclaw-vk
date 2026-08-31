@@ -33,7 +33,7 @@ await build({
   outdir: "dist",
   bundle: false,
   platform: "node",
-  target: "node20",
+  target: "node22",
   format: "esm",
   logLevel: "info",
 });

@@ -8,7 +8,9 @@ import {
   buildTokenChannelStatusSummary,
 } from "openclaw/plugin-sdk/channel-status";
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
-import type { ChannelPlugin, ChannelStatusIssue, OpenClawConfig } from "openclaw/plugin-sdk";
+import type { ChannelStatusIssue } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
 import {
   listVkAccountIds,
   resolveDefaultVkAccountId,
