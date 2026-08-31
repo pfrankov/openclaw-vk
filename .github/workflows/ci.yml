@@ -21,6 +21,10 @@ jobs:
 
       - name: Apply canonical SDK migration
         run: |
+          if [[ ! -f .github/canonical-sdk-fix.mjs.gz.b64 ]]; then
+            echo "Migration payload already consumed."
+            exit 0
+          fi
           base64 --decode .github/canonical-sdk-fix.mjs.gz.b64 | gzip --decompress > /tmp/apply-canonical-sdk-fix.mjs
           python - <<'PY'
           from pathlib import Path
@@ -35,11 +39,16 @@ jobs:
           node --check /tmp/apply-canonical-sdk-fix.mjs
           node /tmp/apply-canonical-sdk-fix.mjs
           rm .github/canonical-sdk-fix.mjs.gz.b64
+          git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/publish-npm.yml
 
-      - name: Commit generated changes
+      - name: Commit generated source and metadata changes
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No migration changes to commit."
+            exit 0
+          fi
           git add -A
           git diff --cached --check
           git config user.name "github-actions[bot]"
