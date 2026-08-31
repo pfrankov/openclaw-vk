@@ -1,57 +1,63 @@
-name: Bootstrap canonical OpenClaw SDK migration
+name: CI
 
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
-    if: github.head_ref == 'fix/openclaw-2026-8-sdk-canonical'
+  test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout migration branch
+      - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 0
+          node-version: 22.22.3
+          cache: npm
 
-      - name: Apply canonical SDK migration
-        run: |
-          if [[ ! -f .github/canonical-sdk-fix.mjs.gz.b64 ]]; then
-            echo "Migration payload already consumed."
-            exit 0
-          fi
-          base64 --decode .github/canonical-sdk-fix.mjs.gz.b64 | gzip --decompress > /tmp/apply-canonical-sdk-fix.mjs
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('/tmp/apply-canonical-sdk-fix.mjs')
-          source = path.read_text()
-          before = 'for (const [before, after] of mediaExpectationReplacements) {'
-          after = 'for (const [before, after] of mediaExpectationReplacements.toSorted((a, b) => b[0].length - a[0].length)) {'
-          if source.count(before) != 1:
-              raise SystemExit(f'expected one media replacement loop, found {source.count(before)}')
-          path.write_text(source.replace(before, after))
-          PY
-          node --check /tmp/apply-canonical-sdk-fix.mjs
-          node /tmp/apply-canonical-sdk-fix.mjs
-          rm .github/canonical-sdk-fix.mjs.gz.b64
-          git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/publish-npm.yml
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Commit generated source and metadata changes
-        env:
-          HEAD_BRANCH: ${{ github.head_ref }}
-        run: |
-          if git diff --quiet && git diff --cached --quiet; then
-            echo "No migration changes to commit."
-            exit 0
-          fi
-          git add -A
-          git diff --cached --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "fix: migrate VK plugin to canonical OpenClaw 2026.8 SDK"
-          git push origin "HEAD:${HEAD_BRANCH}"
+      - name: Run repository checks
+        run: npm run check
+
+  runtime-compatibility:
+    name: OpenClaw runtime (${{ matrix.openclaw }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        openclaw:
+          - "2026.8.1"
+          - latest
+          - beta
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.22.3
+          cache: npm
+
+      - name: Install plugin dependencies
+        run: npm ci
+
+      - name: Install OpenClaw host
+        run: npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw }}"
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Resolve SDK imports and load packaged runtime
+        run: npm run check:runtime
