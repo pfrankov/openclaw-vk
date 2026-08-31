@@ -1,5 +1,4 @@
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
-import { issuePairingChallenge } from "openclaw/plugin-sdk/conversation-runtime";
 import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
 import {
   readStoreAllowFromForDmPolicy,
@@ -8,8 +7,7 @@ import {
 import {
   createReplyPrefixOptions,
   createTypingCallbacks,
-  logTypingFailure,
-} from "openclaw/plugin-sdk/channel-runtime";
+} from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
 import {
   resolveAllowlistProviderRuntimeGroupPolicy,
@@ -31,7 +29,7 @@ import {
 import { getVkRuntime } from "./runtime.js";
 import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
-import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
+import { DEFAULT_TIMING, logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
@@ -200,12 +198,10 @@ export async function handleVkInbound(params: {
       });
       if (!dmAllowed.allowed) {
         if (dmPolicy === "pairing") {
-          await issuePairingChallenge({
-            channel: CHANNEL_ID,
+          await pairing.issueChallenge({
             senderId: senderDisplay,
             senderIdLine: `Your VK user id: ${senderDisplay}`,
             meta: {},
-            upsertPairingRequest: pairing.upsertPairingRequest,
             sendPairingReply: async (text) => {
               await deliverVkReply({
                 payload: { text },

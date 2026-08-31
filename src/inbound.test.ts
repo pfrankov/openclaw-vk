@@ -29,30 +29,28 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
-  createChannelPairingController: ({ core, channel, accountId }: Record<string, unknown>) => ({
-    readStoreForDmPolicy: () =>
-      (core as any).channel.pairing.readAllowFromStore({ channel, accountId }),
-    upsertPairingRequest: (params: Record<string, unknown>) =>
-      (core as any).channel.pairing.upsertPairingRequest({ ...params, accountId }),
-  }),
-}));
-
-vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
-  issuePairingChallenge: async ({
-    upsertPairingRequest,
-    sendPairingReply,
-    senderId,
-    channel,
-    onReplyError,
-  }: Record<string, any>) => {
-    const result = await upsertPairingRequest({ channel, id: senderId });
-    if (result.created && sendPairingReply) {
-      try {
-        await sendPairingReply("pairing-reply-text");
-      } catch (err) {
-        onReplyError?.(err);
+  createChannelPairingController: ({ core, channel, accountId }: Record<string, unknown>) => {
+    const upsertPairingRequest = (params: Record<string, unknown>) =>
+      (core as any).channel.pairing.upsertPairingRequest({ ...params, channel, accountId });
+    return {
+      readStoreForDmPolicy: () =>
+        (core as any).channel.pairing.readAllowFromStore({ channel, accountId }),
+      upsertPairingRequest,
+      issueChallenge: async ({
+        sendPairingReply,
+        senderId,
+        onReplyError,
+      }: Record<string, any>) => {
+        const result = await upsertPairingRequest({ id: senderId });
+        if (result.created && sendPairingReply) {
+          try {
+            await sendPairingReply("pairing-reply-text");
+          } catch (err) {
+            onReplyError?.(err);
+          }
+        }
       }
-    }
+    };
   },
 }));
 
@@ -94,6 +92,7 @@ vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
     clear: vi.fn().mockResolvedValue(undefined),
     restoreInitial: vi.fn().mockResolvedValue(undefined),
   })),
+  logTypingFailure: mockLogTypingFailure,
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
@@ -130,10 +129,9 @@ const mockCreateReplyPrefixOptions = vi.hoisted(() => vi.fn());
 const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/channel-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/channel-reply-pipeline", () => ({
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
-  logTypingFailure: mockLogTypingFailure,
 }));
 
 // ── Internal module mocks ────────────────────────────────────────────────────
