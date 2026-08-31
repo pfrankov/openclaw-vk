@@ -22,6 +22,16 @@ jobs:
       - name: Apply canonical SDK migration
         run: |
           base64 --decode .github/canonical-sdk-fix.mjs.gz.b64 | gzip --decompress > /tmp/apply-canonical-sdk-fix.mjs
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/apply-canonical-sdk-fix.mjs')
+          source = path.read_text()
+          before = 'for (const [before, after] of mediaExpectationReplacements) {'
+          after = 'for (const [before, after] of mediaExpectationReplacements.toSorted((a, b) => b[0].length - a[0].length)) {'
+          if source.count(before) != 1:
+              raise SystemExit(f'expected one media replacement loop, found {source.count(before)}')
+          path.write_text(source.replace(before, after))
+          PY
           node --check /tmp/apply-canonical-sdk-fix.mjs
           node /tmp/apply-canonical-sdk-fix.mjs
           rm .github/canonical-sdk-fix.mjs.gz.b64
