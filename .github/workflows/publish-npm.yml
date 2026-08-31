@@ -24,7 +24,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 22.22.3
           registry-url: https://registry.npmjs.org
           cache: npm
 
@@ -34,8 +34,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Install minimum supported OpenClaw
+        run: npm install --no-save --package-lock=false openclaw@2026.8.1
+
+      - name: Run release checks
+        run: |
+          npm run check
+          npm run check:runtime
 
       - name: Validate package is publishable
         run: |
@@ -55,9 +60,6 @@ jobs:
             echo "Tag and package.json version mismatch"
             exit 1
           fi
-
-      - name: Smoke check package tarball
-        run: npm pack --dry-run
 
       - name: Publish to npm
         run: |
