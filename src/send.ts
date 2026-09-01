@@ -1,5 +1,14 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
+import {
+  cleanupAudioSegments,
+  getVkAudioMessageMaxMs,
+  probeAudioDurationMs,
+  splitAudioAtSilence,
+} from "./audio-chunk.js";
 import {
   renderVkMarkdownChunks,
   type VkPreparedFormattedMessage,
@@ -25,7 +34,24 @@ const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
-  "Attachment generated, but VK token lacks media upload scopes (photos/docs).";
+  "Attachment could not be delivered; sent as text instead.";
+
+// Opt-in diagnostics: when VK_VOICE_DEBUG_LOG points at a writable file path,
+// append voice/media send breadcrumbs there. No-op otherwise. Used to capture
+// the real cause of intermittent audio_message upload failures (e.g. a missing
+// peer_id surfaces from VK as a misleading "access denied / scopes" error 15).
+async function logVkVoiceDebug(line: string): Promise<void> {
+  const target = process.env.VK_VOICE_DEBUG_LOG;
+  if (!target) {
+    return;
+  }
+  try {
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(target, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {
+    /* diagnostics only — never break a send */
+  }
+}
 const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
@@ -174,14 +200,22 @@ function isRetryableVkError(error: unknown): boolean {
   );
 }
 
-async function withVkRetry<T>(operation: () => Promise<T>): Promise<T> {
+async function withVkRetry<T>(
+  operation: () => Promise<T>,
+  opts?: { extraRetryableCodes?: readonly number[]; maxAttempts?: number },
+): Promise<T> {
+  const maxAttempts = opts?.maxAttempts ?? VK_TRANSIENT_RETRY_ATTEMPTS;
   let attempt = 0;
   while (true) {
     try {
       return await operation();
     } catch (error) {
       attempt += 1;
-      if (attempt >= VK_TRANSIENT_RETRY_ATTEMPTS || !isRetryableVkError(error)) {
+      const code = readVkErrorCode(error);
+      const retryable =
+        isRetryableVkError(error) ||
+        (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false));
+      if (attempt >= maxAttempts || !retryable) {
         throw error;
       }
       await sleep(250 * attempt);
@@ -477,6 +511,7 @@ export async function sendMessageVk(
   text: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
+  await logVkVoiceDebug(`ENTRY sendMessageVk to=${JSON.stringify(to)} textLen=${(text ?? "").length}`);
   const parsed = resolveVkMarkdownAttachmentPayload(text);
   const results = await sendPayloadResultsVk({
     to,
@@ -596,6 +631,86 @@ export async function sendDocumentVk(
   return getLastSendResult(tailResults) ?? firstResult;
 }
 
+/**
+ * Returns a local filesystem path usable by ffmpeg for `audioSource`, plus a
+ * cleanup callback. Buffers are written to a temp file. Non-local strings
+ * (http/data/file:// etc.) yield `null` so the caller skips splitting.
+ */
+async function materializeLocalAudioFile(
+  audioSource: string | Buffer,
+  title: string,
+): Promise<{ path: string; cleanup: () => Promise<void> } | null> {
+  if (Buffer.isBuffer(audioSource)) {
+    try {
+      const dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
+      const safeName = title.replace(/[\\/]/g, "_") || "voice.ogg";
+      const path = join(dir, safeName);
+      await writeFile(path, audioSource);
+      return {
+        path,
+        cleanup: async () => {
+          await rm(dir, { recursive: true, force: true }).catch(() => {});
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Only plain local paths can be probed/split. http/data/file:// are skipped.
+  if (
+    isHttpUrl(audioSource) ||
+    /^data:/i.test(audioSource) ||
+    audioSource.startsWith("file://")
+  ) {
+    return null;
+  }
+  return { path: audioSource, cleanup: async () => {} };
+}
+
+async function uploadVkAudioMessage(params: {
+  vk: VK;
+  peerId: number;
+  source: string | Buffer;
+  filename: string;
+  contentType?: string;
+}): Promise<string> {
+  // Guard against an invalid peer_id (would surface from VK as a misleading
+  // error 15 "access denied … with current scopes", even though the token's
+  // scopes are fine). Fail loud and accurate instead.
+  if (!Number.isFinite(params.peerId) || params.peerId <= 0) {
+    await logVkVoiceDebug(
+      `uploadVkAudioMessage ABORT invalid peerId=${JSON.stringify(params.peerId)} filename=${params.filename}`,
+    );
+    throw new Error(
+      `VK audio upload aborted: invalid peer_id (${JSON.stringify(params.peerId)}); peer_id is required for audio_message uploads`,
+    );
+  }
+  await logVkVoiceDebug(
+    `uploadVkAudioMessage peerId=${params.peerId} filename=${params.filename}`,
+  );
+  // Even with a valid peer_id, docs.getMessagesUploadServer(type=audio_message)
+  // intermittently returns error 15 when the call gets batched with concurrent
+  // requests on the shared (apiLimit) VK client. Verified ~20% failure under
+  // concurrency vs 0% sequentially. The call is otherwise idempotent, so treat
+  // 15 as transient here and retry — a re-issued (unbatched) call succeeds.
+  const attachment = await withVkRetry(
+    async () => {
+      return await params.vk.upload.audioMessage({
+        peer_id: params.peerId,
+        source: buildVkUploadSource({
+          source: params.source,
+          filename: params.filename,
+          contentType: params.contentType,
+        }),
+        title: params.filename,
+      });
+    },
+    { extraRetryableCodes: [15], maxAttempts: 5 },
+  );
+  return String(attachment);
+}
+
 export async function sendAudioMessageVk(
   to: string,
   audioSource: string | Buffer,
@@ -610,24 +725,57 @@ export async function sendAudioMessageVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
-  const attachment = await withVkRetry(async () => {
-    return await vk.upload.audioMessage({
-      peer_id: peerId,
-      source: buildVkUploadSource({
-        source: audioSource,
-        filename: title,
-        contentType: uploadMeta?.contentType,
-      }),
-      title,
-    });
-  });
   const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
+
+  // ── Attempt silence-based split for over-limit local audio ────────────────
+  const local = await materializeLocalAudioFile(audioSource, title);
+  if (local) {
+    const maxMs = getVkAudioMessageMaxMs();
+    let segments: string[] = [];
+    try {
+      const durationMs = await probeAudioDurationMs(local.path);
+      if (durationMs !== null && durationMs > maxMs) {
+        segments = await splitAudioAtSilence(local.path, maxMs);
+      }
+    } catch {
+      segments = [];
+    }
+
+    if (segments.length >= 2) {
+      try {
+        return await sendVkAudioSegments({
+          to: normalizedTo,
+          peerId,
+          account,
+          vk,
+          segments,
+          contentType: uploadMeta?.contentType,
+          firstChunk,
+          tailChunks,
+          opts,
+        });
+      } finally {
+        await cleanupAudioSegments(segments);
+        await local.cleanup();
+      }
+    }
+    await local.cleanup();
+  }
+
+  // ── Single-message path (short audio / split unavailable) ─────────────────
+  const attachment = await uploadVkAudioMessage({
+    vk,
+    peerId,
+    source: audioSource,
+    filename: title,
+    contentType: uploadMeta?.contentType,
+  });
   const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
     account,
     formatted: firstChunk ?? { text: "" },
-    attachment: String(attachment),
+    attachment,
     opts: {
       ...opts,
       buttons: tailChunks.length === 0 ? opts.buttons : undefined,
@@ -651,6 +799,71 @@ export async function sendAudioMessageVk(
   return getLastSendResult(tailResults) ?? firstResult;
 }
 
+/**
+ * Sends N audio segments as separate VK voice messages in order, then the
+ * remaining text chunks. The first text chunk + replyTo ride the first voice;
+ * buttons/clearKeyboard apply only to the very last sent message.
+ */
+async function sendVkAudioSegments(params: {
+  to: string;
+  peerId: number;
+  account: ResolvedVkAccount;
+  vk: VK;
+  segments: readonly string[];
+  contentType?: string;
+  firstChunk?: VkPreparedFormattedMessage;
+  tailChunks: VkPreparedFormattedMessage[];
+  opts: SendVkOptions;
+}): Promise<SendVkResult> {
+  const { segments, tailChunks, opts } = params;
+  const hasTail = tailChunks.length > 0;
+  const results: SendVkResult[] = [];
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index] as string;
+    const isFirst = index === 0;
+    const isLastSegment = index === segments.length - 1;
+    const applyKeyboard = isLastSegment && !hasTail;
+
+    const attachment = await uploadVkAudioMessage({
+      vk: params.vk,
+      peerId: params.peerId,
+      source: segment,
+      filename: `voice-${String(index + 1).padStart(2, "0")}.ogg`,
+      contentType: params.contentType,
+    });
+
+    const result = await sendVkApiMessage({
+      to: params.to,
+      peerId: params.peerId,
+      account: params.account,
+      formatted: isFirst ? params.firstChunk ?? { text: "" } : { text: "" },
+      attachment,
+      opts: {
+        ...opts,
+        replyTo: isFirst ? opts.replyTo : undefined,
+        buttons: applyKeyboard ? opts.buttons : undefined,
+        clearKeyboard: applyKeyboard ? opts.clearKeyboard : undefined,
+      },
+    });
+    results.push(result);
+  }
+
+  if (hasTail) {
+    const tailResults = await sendMessageChunksVk({
+      to: params.to,
+      chunks: tailChunks,
+      opts: {
+        ...opts,
+        replyTo: undefined,
+      },
+    });
+    results.push(...tailResults);
+  }
+
+  return getLastSendResult(results) ?? { messageId: "", chatId: params.to };
+}
+
 export async function sendFormattedTextVk(
   to: string,
   text: string,
@@ -671,6 +884,7 @@ export async function sendFormattedMediaVk(
   mediaUrl: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
+  await logVkVoiceDebug(`ENTRY sendFormattedMediaVk to=${JSON.stringify(to)} mediaUrl=${JSON.stringify(mediaUrl)} textLen=${(text ?? "").length}`);
   const result = await sendPayloadVk(
     to,
     {
@@ -922,9 +1136,16 @@ async function sendResolvedMediaVk(params: {
         contentType: media.mimeType,
       });
     } catch (audioError) {
-      if (!isVkScopeDeniedError(audioError)) {
-        throw audioError;
-      }
+      // Voice is best-effort: log the *real* VK error (code/message) for
+      // diagnosis, then fall back to text rather than dropping the reply or
+      // mislabelling it as a scopes problem.
+      await logVkVoiceDebug(
+        `audio send FAILED to=${JSON.stringify(params.to)} code=${
+          (audioError as { code?: unknown })?.code
+        } scopeDenied=${isVkScopeDeniedError(audioError)} msg=${String(
+          (audioError as { message?: unknown })?.message ?? "",
+        ).slice(0, 200)}`,
+      );
       return await sendSourceUrlFallback();
     }
   }
@@ -1011,6 +1232,9 @@ export async function sendPayloadVk(
   opts: SendVkOptions = {},
 ): Promise<SendVkResult | null> {
   const { text, mediaRefs, buttons, replyTo, clearKeyboard } = resolveVkPayloadParts(payload, opts);
+  await logVkVoiceDebug(
+    `ENTRY sendPayloadVk to=${JSON.stringify(to)} mediaRefs=${JSON.stringify((mediaRefs ?? []).map((r) => r?.url))} textLen=${(text ?? "").length}`,
+  );
 
   return getLastSendResult(
     await sendPayloadResultsVk({

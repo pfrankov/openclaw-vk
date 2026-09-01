@@ -6,6 +6,7 @@ const entryPoints = [
   "setup-entry.ts",
   "api.ts",
   "src/accounts.ts",
+  "src/audio-chunk.ts",
   "src/channel.setup.ts",
   "src/channel.ts",
   "src/config-schema.ts",

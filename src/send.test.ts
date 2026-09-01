@@ -96,6 +96,18 @@ vi.mock("vk-io", () => ({
 }));
 vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
 
+// ── audio-chunk mocks (ffmpeg/ffprobe split) ────────────────────────────────
+const mockProbeAudioDurationMs = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockSplitAudioAtSilence = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+const mockCleanupAudioSegments = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock("./audio-chunk.js", () => ({
+  getVkAudioMessageMaxMs: () => 270_000,
+  probeAudioDurationMs: mockProbeAudioDurationMs,
+  splitAudioAtSilence: mockSplitAudioAtSilence,
+  cleanupAudioSegments: mockCleanupAudioSegments,
+}));
+
 const TOKEN = "test-token";
 const cfg = { channels: { vk: { token: TOKEN } } } as never;
 
@@ -544,6 +556,9 @@ describe("sendAudioMessageVk", () => {
     clearVkInstances();
     mockMessagesSend.mockReset();
     mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+    mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+    mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+    mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
     vi.mocked(VK).mockClear();
   });
 
@@ -569,6 +584,111 @@ describe("sendAudioMessageVk", () => {
         attachment: "audio_message123_789",
       }),
     );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+    // Remote URL → split is skipped entirely (not a local path).
+    expect(mockProbeAudioDurationMs).not.toHaveBeenCalled();
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+  });
+
+  it("keeps the single-message path for a short local file", async () => {
+    mockMessagesSend.mockResolvedValueOnce(88);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(60_000); // 1 min ≤ limit
+
+    const result = await sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockProbeAudioDurationMs).toHaveBeenCalledWith("/tmp/voice.ogg");
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("splits an over-limit local file into multiple voice messages", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000); // 10 min > limit
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockResolvedValueOnce(101).mockResolvedValueOnce(102);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+      cfg,
+      replyTo: "777",
+    });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000);
+    // Two voice uploads, one per segment.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({ value: "/tmp/part-0.ogg" }),
+    });
+    // Two voice messages sent in order; caption + replyTo on first only.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(0)).toMatchObject({
+      message: "caption",
+      attachment: "audio_part1",
+      reply_to: 777,
+    });
+    expect(getSendCall(1)).toMatchObject({ attachment: "audio_part2" });
+    expect(getSendCall(1)).not.toHaveProperty("reply_to");
+    // Segment temp files cleaned up.
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    expect(result).toEqual({ messageId: "102", chatId: "456" });
+  });
+
+  it("sends tail text chunks after all voice segments", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    // 2 voice sends + 1 tail text-chunk send (5000 chars → 4096 + 904; the
+    // first 4096 chunk rides voice #1, the 904 remainder is the single tail).
+    mockMessagesSend
+      .mockResolvedValueOnce(101)
+      .mockResolvedValueOnce(102)
+      .mockResolvedValueOnce(103);
+
+    const longTail = "a".repeat(5000);
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", longTail, { cfg });
+
+    // First voice carries chunk 0; remaining text chunk comes after both voices.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+    expect(getSendCall(0).attachment).toBe("audio_part1");
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(1).attachment).toBe("audio_part2");
+    expect(getSendCall(2)).not.toHaveProperty("attachment");
+    expect(getSendCall(2).message).toBe("a".repeat(904));
+    expect(result).toEqual({ messageId: "103", chatId: "456" });
+  });
+
+  it("falls back to single upload when split fails (ffmpeg error)", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce([]); // split could not produce ≥2 parts
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledTimes(1);
+    // Falls back to the single upload of the original source.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({ value: "/tmp/long.ogg" }),
+    });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not crash and falls back when probe throws", async () => {
+    mockProbeAudioDurationMs.mockRejectedValueOnce(new Error("ffprobe missing"));
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ messageId: "88", chatId: "456" });
   });
 });
@@ -1213,7 +1333,7 @@ describe("sendPayloadVk", () => {
     const fallbackCall = getSendCall(mockMessagesSend.mock.calls.length - 1);
     expect(fallbackCall.message).toContain("caption");
     expect(fallbackCall.message).toContain(
-      "Attachment generated, but VK token lacks media upload scopes (photos/docs).",
+      "Attachment could not be delivered; sent as text instead.",
     );
     expect(fallbackCall).not.toHaveProperty("attachment");
   });
@@ -1252,7 +1372,9 @@ describe("sendPayloadVk", () => {
       new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
       { code: 15 },
     );
-    mockUploadAudioMessage.mockRejectedValueOnce(scopeError);
+    // Error 15 is retried (transient under batching); reject every attempt so
+    // the retries are exhausted and the URL-text fallback is exercised.
+    mockUploadAudioMessage.mockRejectedValue(scopeError);
     mockMessagesSend.mockResolvedValueOnce(37);
 
     const result = await sendPayloadVk(
@@ -1272,20 +1394,26 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("rethrows non-scope audio_message upload errors", async () => {
+  it("falls back to text when audio_message upload fails (voice is best-effort)", async () => {
     const audioError = new Error("audio upload exploded");
-    mockUploadAudioMessage.mockRejectedValueOnce(audioError);
+    mockUploadAudioMessage.mockRejectedValue(audioError);
+    mockMessagesSend.mockResolvedValueOnce(41);
 
-    await expect(
-      sendPayloadVk(
-        "123",
-        {
-          text: "voice caption",
-          mediaUrl: "https://example.com/voice.mp3",
-        },
-        { cfg },
-      ),
-    ).rejects.toThrow("audio upload exploded");
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "41", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "voice caption\nhttps://example.com/voice.mp3",
+      }),
+    );
   });
 
   it("sends remaining text chunks after media as plain messages", async () => {
