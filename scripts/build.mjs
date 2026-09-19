@@ -5,6 +5,7 @@ const entryPoints = [
   "index.ts",
   "setup-entry.ts",
   "api.ts",
+  "doctor-contract-api.ts",
   "src/accounts.ts",
   "src/channel.setup.ts",
   "src/channel.ts",

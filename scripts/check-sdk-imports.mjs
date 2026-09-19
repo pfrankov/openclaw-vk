@@ -3,7 +3,7 @@ import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const scanRoots = ["api.ts", "index.ts", "setup-entry.ts", "src"];
+const scanRoots = ["api.ts", "doctor-contract-api.ts", "index.ts", "setup-entry.ts", "src"];
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
 
 const forbiddenImports = new Map([

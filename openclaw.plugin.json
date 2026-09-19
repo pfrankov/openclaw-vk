@@ -1,6 +1,9 @@
 {
   "id": "vk",
   "channels": ["vk"],
+  "doctorContract": {
+    "stateMigrations": []
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

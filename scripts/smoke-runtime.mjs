@@ -3,7 +3,7 @@ import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const sourceRoots = ["api.ts", "index.ts", "setup-entry.ts", "src"];
+const sourceRoots = ["api.ts", "doctor-contract-api.ts", "index.ts", "setup-entry.ts", "src"];
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
 
 try {
@@ -91,6 +91,27 @@ for (const entrypoint of ["dist/index.js", "dist/setup-entry.js"]) {
   }
 }
 
+const manifest = JSON.parse(await readFile(join(repoRoot, "openclaw.plugin.json"), "utf8"));
+const declaredStateMigrations = manifest.doctorContract?.stateMigrations;
+const doctorContract = await import(
+  pathToFileURL(join(repoRoot, "dist/doctor-contract-api.js")).href
+);
+if (!Array.isArray(declaredStateMigrations) || !Array.isArray(doctorContract.stateMigrations)) {
+  throw new Error(
+    "openclaw.plugin.json doctorContract.stateMigrations and dist/doctor-contract-api.js must both export an array",
+  );
+}
+const exportedStateMigrations = doctorContract.stateMigrations.map((migration) => ({
+  id: migration.id,
+  ...(migration.doctorOnly === true ? { doctorOnly: true } : {}),
+  ...(migration.phase === "after-session-repair" ? { phase: migration.phase } : {}),
+}));
+if (JSON.stringify(exportedStateMigrations) !== JSON.stringify(declaredStateMigrations)) {
+  throw new Error(
+    "dist/doctor-contract-api.js stateMigrations must match openclaw.plugin.json doctorContract.stateMigrations (ids, order, doctorOnly, phase)",
+  );
+}
+
 console.log(
-  `Resolved ${sdkSpecifiers.size} SDK subpaths and loaded ${builtModules.length} built modules successfully.`,
+  `Resolved ${sdkSpecifiers.size} SDK subpaths, loaded ${builtModules.length} built modules, and verified the doctor contract successfully.`,
 );

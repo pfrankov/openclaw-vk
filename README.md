@@ -247,6 +247,8 @@ openclaw channels status --json --probe
 - Upload для изображений: <https://dev.vk.com/ru/method/photos.getMessagesUploadServer>
 - Upload для документов и голосовых: <https://dev.vk.com/ru/method/docs.getMessagesUploadServer>
 
+**`Plugin "vk" state migration is pending` в `openclaw doctor` / `Startup migrations need attention` в `openclaw status`** — установлена версия плагина без Doctor-контракта (`doctorContract` в манифесте). Канал при этом работает, но шлюз стартует в «degraded state». Обновите плагин до версии с контрактом, затем выполните `openclaw doctor --fix` и перезапустите шлюз.
+
 **Бот не отвечает, ошибок нет** — сообщения отклоняются политиками доступа. Проверьте `dmPolicy`, `allowFrom` и `requireMention`. Логи: `~/.openclaw/logs/commands.log` (фильтруйте по `"source":"vk"`).
 
 ---

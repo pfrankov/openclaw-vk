@@ -12,7 +12,8 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 ## Local Code Map
 - `index.ts`: channel plugin entry (`defineChannelPluginEntry`)
 - `setup-entry.ts`: setup wizard entry (`defineSetupPluginEntry`)
-- `openclaw.plugin.json`: plugin manifest (`id`, channels, config schema)
+- `doctor-contract-api.ts`: OpenClaw Doctor contract (`stateMigrations`, mirrored by `doctorContract` in the manifest)
+- `openclaw.plugin.json`: plugin manifest (`id`, channels, `doctorContract`, config schema)
 - `src/config-schema.ts`: account/channel config JSON schema builder
 - `src/channel.ts`: main channel behavior (routing, security, status, gateway start/stop)
 - `src/channel.setup.ts`: setup-time plugin surface
