@@ -87,6 +87,18 @@ const VkAudioSchema = z
   .strict()
   .optional();
 
+// Step-progress draft (`channels.vk.streaming`). Only the mode is typed here:
+// the draft is rendered by the core compositor, which owns and validates every
+// key below it (`progress.label`, `progress.maxLines`, …). VK implements the
+// `progress` mode only, so the other core modes are not accepted — they would
+// be a setting that does nothing.
+const VkStreamingSchema = z
+  .object({
+    mode: z.enum(["off", "progress"]).optional(),
+  })
+  .passthrough()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
@@ -119,6 +131,8 @@ export const VkConfigSchema = VkAccountSchemaBase.extend({
   diagnostics: VkDiagnosticsSchema,
   // Channel-wide only: settings.ts reads channels.vk.audio for every account.
   audio: VkAudioSchema,
+  // Channel-wide only: inbound.ts reads channels.vk.streaming for every account.
+  streaming: VkStreamingSchema,
   accounts: z.record(z.string(), VkAccountSchema).optional(),
 }).superRefine((value, ctx) => {
   requireOpenAllowFrom({

@@ -80,9 +80,23 @@
               }
             }
           },
+          "streaming": {
+            "type": "object",
+            "description": "Channel-wide step-progress draft: with `mode: \"progress\"` the agent's execution steps are shown in one message edited in place, which then becomes the answer. Only the mode is typed here; the keys below it (`progress.label`, `progress.maxLines`, …) belong to the core draft renderer. Not accepted per account.",
+            "additionalProperties": true,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "progress"
+                ]
+              }
+            }
+          },
           "accounts": {
             "type": "object",
-            "description": "Per-account overrides. Diagnostics and voice limits are channel-wide; contextVisibility can be overridden here.",
+            "description": "Per-account overrides. Diagnostics, voice limits and the step-progress draft are channel-wide; contextVisibility can be overridden here.",
             "additionalProperties": {
               "type": "object",
               "allOf": [
@@ -97,6 +111,13 @@
                   "not": {
                     "required": [
                       "audio"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "streaming"
                     ]
                   }
                 }

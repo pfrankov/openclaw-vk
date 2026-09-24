@@ -3,6 +3,11 @@ import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
 
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
+
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
@@ -132,6 +137,30 @@ vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   }),
 }));
 
+// Faithful to the core (`reply-payload`): a supplement is recognised only when it
+// carries spoken text AND media, and the "already delivered" flag survives only
+// when it is literally true. A looser stub would let the tests below pass while
+// the plugin still deleted the draft.
+vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
+  getReplyPayloadTtsSupplement: (payload: {
+    ttsSupplement?: { spokenText?: string; visibleTextAlreadyDelivered?: boolean };
+    mediaUrl?: string;
+    mediaUrls?: string[];
+  }) => {
+    const spokenText = payload?.ttsSupplement?.spokenText?.trim();
+    const hasMedia = Boolean(payload?.mediaUrl || payload?.mediaUrls?.length);
+    if (!spokenText || !hasMedia) {
+      return undefined;
+    }
+    return {
+      spokenText,
+      ...(payload.ttsSupplement?.visibleTextAlreadyDelivered === true
+        ? { visibleTextAlreadyDelivered: true }
+        : {}),
+    };
+  },
+}));
+
 vi.mock("openclaw/plugin-sdk/command-auth-native", () => ({
   resolveControlCommandGate: vi.fn(() => ({
     shouldBlock: false,
@@ -154,6 +183,36 @@ const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  resolveChannelPreviewStreamMode: mockResolveStreamMode,
+  // Return the raw input as the "line" so tests can assert what was built.
+  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
+  // The core decides whether a final is truncated and which text wins. Mirrors
+  // the core (channel-outbound): only a final that ends in an ellipsis after at
+  // least 48 characters counts as truncated, and only a candidate that extends
+  // it by a real continuation wins — an empty final never selects anything.
+  isPotentialTruncatedFinal: (text: string) => {
+    const trimmed = text.trimEnd();
+    const untruncated = trimmed.replace(/(?<!\s)(?:\s*(?:\.{3}|\u2026))+$/u, "").trimEnd();
+    return untruncated.length >= 48 && untruncated !== trimmed;
+  },
+  selectLongerFinalText: ({
+    finalText,
+    candidateTexts,
+  }: {
+    finalText: string;
+    candidateTexts: readonly (string | undefined)[];
+  }) => {
+    const final = finalText.trimEnd();
+    const untruncated = final.replace(/(?<!\s)(?:\s*(?:\.{3}|\u2026))+$/u, "").trimEnd();
+    if (untruncated.length < 48 || untruncated === final) return undefined;
+    for (const candidate of candidateTexts) {
+      const text = candidate?.trimEnd();
+      if (!text || text.length <= final.length || !text.startsWith(untruncated)) continue;
+      const continuation = text.slice(untruncated.length).trimStart();
+      if (continuation.length >= 24 && /^[\p{L}\p{N}]/u.test(continuation)) return text;
+    }
+    return undefined;
+  },
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
@@ -172,6 +231,52 @@ vi.mock("openclaw/plugin-sdk/security-runtime", () => ({
           : { include: false, reason: "blocked" },
 }));
 
+// Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
+// individual tests flip resolveChannelPreviewStreamMode to "progress".
+const mockResolveStreamMode = vi.hoisted(() => vi.fn(() => "off"));
+const mockProgressCompositor = vi.hoisted(() => ({
+  noteActivity: vi.fn().mockResolvedValue(true),
+  pushToolProgress: vi.fn().mockResolvedValue(true),
+  pushReasoningProgress: vi.fn().mockResolvedValue(true),
+  markFinalReplyStarted: vi.fn(),
+  markFinalReplyDelivered: vi.fn(),
+  cancel: vi.fn(),
+}));
+// currentMessageId defaults to undefined (no live draft); the edit-into-answer
+// test overrides it to a number to exercise the single-bubble finalize.
+const mockCurrentMessageId = vi.hoisted(() => vi.fn<() => number | undefined>(() => undefined));
+const mockDraftRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockDraftClose = vi.hoisted(() => vi.fn());
+// `overwrite` resolves to whether the text made it into the draft; shared so a
+// test can make one write fail.
+const mockDraftOverwrite = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mockCreateVkProgressDraft = vi.hoisted(() =>
+  vi.fn(() => ({
+    compositor: mockProgressCompositor,
+    currentMessageId: mockCurrentMessageId,
+    overwrite: mockDraftOverwrite,
+    remove: mockDraftRemove,
+    // Like the real handle: the message is let go of, nothing is deleted.
+    detach: vi.fn(() => mockCurrentMessageId.mockReturnValue(undefined)),
+    close: mockDraftClose,
+  })),
+);
+
+vi.mock("./progress-draft.js", () => ({
+  // The label resolver lives in the same module — the mock keeps the real config
+  // parsing, otherwise the test would never check that the label comes from
+  // settings at all.
+  // Takes the channel entry now, not the whole config: the label is resolved
+  // through the core, which reads the same entry the compositor is given.
+  resolveVkProgressLabel: (entry: any) => {
+    const label = entry?.streaming?.progress?.label;
+    return typeof label === "string" && label.trim() && label.trim() !== "auto"
+      ? label.trim()
+      : undefined;
+  },
+  createVkProgressDraftCompositor: mockCreateVkProgressDraft,
+}));
+
 // ── Internal module mocks ────────────────────────────────────────────────────
 
 const mockSendPayloadVk = vi.hoisted(() =>
@@ -179,6 +284,7 @@ const mockSendPayloadVk = vi.hoisted(() =>
 );
 const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockEditMessageVk = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mockResolveVkOwnGroup = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ id: 239104331, name: "Карамелька" }),
 );
@@ -187,6 +293,12 @@ vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
+  // editMessageVk backs the edit-in-place finalize.
+  editMessageVk: mockEditMessageVk,
+  sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
+  // No markdown attachments in these tests; the real parser is exercised in
+  // inbound.draft.sdk.test.ts.
+  splitVkMarkdownAttachments: (text: string) => ({ text, attachments: [] }),
   resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
@@ -238,6 +350,19 @@ beforeEach(() => {
   mockMarkMessageReadVk.mockReset().mockResolvedValue(undefined);
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
+  mockResolveStreamMode.mockReset().mockReturnValue("off");
+  mockCreateVkProgressDraft.mockClear();
+  mockCurrentMessageId.mockReset().mockReturnValue(undefined);
+  mockDraftRemove.mockClear();
+  mockDraftClose.mockClear();
+  mockDraftOverwrite.mockReset().mockResolvedValue(true);
+  mockEditMessageVk.mockReset().mockResolvedValue(true);
+  mockProgressCompositor.noteActivity.mockClear();
+  mockProgressCompositor.pushToolProgress.mockClear();
+  mockProgressCompositor.pushReasoningProgress.mockClear();
+  mockProgressCompositor.markFinalReplyStarted.mockClear();
+  mockProgressCompositor.markFinalReplyDelivered.mockClear();
+  mockProgressCompositor.cancel.mockClear();
   PREFIX_OPTIONS.responsePrefixContextProvider.mockReset().mockReturnValue({});
   PREFIX_OPTIONS.onModelSelected.mockReset();
   mockCreateReplyPrefixOptions.mockReset().mockReturnValue(PREFIX_OPTIONS);
@@ -1544,6 +1669,539 @@ describe("command gating", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).toHaveBeenCalledOnce();
+  });
+});
+
+// ── Step-progress draft ──────────────────────────────────────────────────────
+
+describe("step-progress (channels.vk.streaming.mode=progress)", () => {
+  it("routes execution steps to the edit-in-place draft and finalizes on the last block", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "done" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // A draft compositor was created and fed by the execution steps.
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
+    // The step is rendered from a built line (not undefined) and shown at once.
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
+    // The final answer still flows through the normal deliver path…
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    // …bracketed by the compositor's finalize signals.
+    expect(mockProgressCompositor.markFinalReplyStarted).toHaveBeenCalledTimes(1);
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the draft when the final carries no text but the draft already holds the answer", async () => {
+    // Some models deliver the answer text as a block along the way, so it lands
+    // in the draft, and then send an empty final (voice only). Deleting the draft
+    // there leaves the recipient with no text at all. Models that put the whole
+    // text in the final never hit this.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        // The answer arrives as a block and lands in the draft…
+        await dispatcherOptions.deliver({ text: "вот полный ответ" }, { kind: "block" });
+        // …while the final carries only the voice message, no text.
+        await dispatcherOptions.deliver(
+          { text: "", mediaUrl: "/tmp/voice.ogg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The draft stays: it is the answer.
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("keeps the fuller draft when the final arrives truncated", async () => {
+    // The old test was `!finalText` — a final that is present but plainly cut
+    // short still lost the fuller answer along with the draft. The core decides
+    // both questions now: whether the final looks truncated, and which text wins.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockEditMessageVk.mockClear();
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(async ({ dispatcherOptions }: any) => {
+      await dispatcherOptions.onReplyStart?.();
+      await dispatcherOptions.deliver(
+        { text: "полный ответ, который сложился из блоков по ходу работы" },
+        { kind: "block" },
+      );
+      await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+    });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+      expect.anything(),
+    );
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  // ── Voice supplement must not decide the draft's fate ─────────────────────
+  // The core follows a delivered answer with a SECOND final that carries only
+  // audio and no text, marked `visibleTextAlreadyDelivered`. Read as an ordinary
+  // final, its empty text means "no answer came" and the draft holding the answer
+  // is deleted, and the recipient is left with a picture plus a voice note and
+  // no text at all.
+  const voiceSupplement = (spokenText = "полный ответ, который уже отправлен") => ({
+    mediaUrl: "/tmp/speech.opus",
+    audioAsVoice: true,
+    ttsSupplement: { spokenText, visibleTextAlreadyDelivered: true },
+  });
+
+  it("keeps the draft holding the answer when a voice supplement follows", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "вот график, который ты просил", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    // Both attachments still reach the person: the picture and then its voice.
+    const sent = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sent).toContain("/tmp/speech.opus");
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("keeps the draft when a supplement follows an answer without a picture", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "ответ целиком" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("delivers the voice supplement when there is no draft at all", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "ответ" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "off" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(JSON.stringify(mockSendPayloadVk.mock.calls)).toContain("/tmp/speech.opus");
+  });
+
+  it("keeps the draft even after the accumulated block text was reset by a tool step", async () => {
+    // A tool step wipes `draftAnswerText`, so by the time the
+    // supplement arrives the plugin has no accumulated answer of its own — which
+    // is exactly the state in which it used to delete the draft.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(8416);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "начало работы" }, { kind: "block" });
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "итог с картинкой", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("lets the draft keep the fuller answer when a truncated final is followed by a supplement", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver(
+          { text: "полный ответ, который сложился из блоков по ходу работы" },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+      expect.anything(),
+    );
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("still drops the draft when an empty final is NOT marked as a supplement", async () => {
+    // The guard is the mark, not the empty text: an ordinary media-only final
+    // with nothing kept in the draft still drops it, exactly as before.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { mediaUrl: "/tmp/speech.opus", audioAsVoice: true },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("survives several voice supplements in a row", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "две картинки", mediaUrl: "/tmp/a.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement("первая часть"), { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement("вторая часть"), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("sends the block the usual way when the draft write fails", async () => {
+    // `overwrite` reports the outcome instead of throwing, so a failed VK edit
+    // has to be checked. Missing that left the person with nothing at all on a
+    // blocks-plus-empty-final turn: the block went into a draft that was never
+    // written, and the final carried no text of its own.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftOverwrite.mockResolvedValueOnce(false);
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "ответ блоком" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The block reached the person as an ordinary message rather than vanishing.
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    const sentText = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sentText).toContain("ответ блоком");
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("builds no draft when streaming mode is off (default reactions/plain path)", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockCreateVkProgressDraft).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
+  });
+
+  it("runs reactions AND the step draft together when both are enabled (Telegram parity)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const { createStatusReactionController } = await import(
+      "openclaw/plugin-sdk/channel-feedback"
+    );
+    const mockStatusReactionCtrl = {
+      setQueued: vi.fn(),
+      setThinking: vi.fn(),
+      setTool: vi.fn(),
+      setCompacting: vi.fn(),
+      setDone: vi.fn().mockResolvedValue(undefined),
+      setError: vi.fn().mockResolvedValue(undefined),
+      cancelPending: vi.fn(),
+      clear: vi.fn().mockResolvedValue(undefined),
+      restoreInitial: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(createStatusReactionController).mockReturnValueOnce(mockStatusReactionCtrl as never);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ replyOptions }: any) => {
+        await replyOptions.onToolStart?.({ name: "Bash" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: {
+        ...baseCfg({ streaming: { mode: "progress" } }),
+        messages: { statusReactions: { enabled: true }, ackReactionScope: "all" },
+      } as CoreConfig,
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // Both controllers exist and the single onToolStart fans out to each.
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
+    expect(mockStatusReactionCtrl.setTool).toHaveBeenCalledWith("Bash");
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
+  });
+
+  it("edits the live draft INTO the final answer (single bubble) for a plain text reply", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555); // a live draft exists
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The draft message is edited into the answer; no separate reply is sent.
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      "The answer.",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockSendPayloadVk).not.toHaveBeenCalled();
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a normal reply when the draft edit fails (answer never lost)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    mockEditMessageVk.mockResolvedValue(false); // edit fails
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+
+  it("sends an intermediate block with a picture as its own message, labelled", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(777);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "Кадр 38, проба 1", mediaUrl: "https://example/frame.jpg" },
+          { kind: "block" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 9 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({
+        streaming: { mode: "progress", progress: { label: "⏳ Работаю" } },
+      }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // A picture cannot go into the draft, so such a chunk goes as its own
+    // message — the label keeps it from looking like a finished answer.
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        text: expect.stringContaining("⏳ Работаю"),
+        mediaUrl: "https://example/frame.jpg",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("editing into the answer also works for media replies (voice follows separately)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "See this", mediaUrl: "https://example/y.jpg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The progress draft is rewritten with the answer text…
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      expect.stringContaining("See this"),
+      expect.anything(),
+      expect.anything(),
+    );
+    // …and the image or voice message follows as a separate message.
+    expect(mockSendPayloadVk).toHaveBeenCalled();
   });
 });
 

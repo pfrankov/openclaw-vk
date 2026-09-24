@@ -241,6 +241,29 @@ describe("VkConfigSchema", () => {
     expect(result.success).toBe(false);
     expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
   });
+
+  // The step-progress draft is read from channels.vk.streaming only (inbound.ts).
+  it("accepts the progress streaming mode at channel level, with core-owned draft keys", () => {
+    const result = VkConfigSchema.safeParse({
+      streaming: { mode: "progress", progress: { label: "Working", maxLines: 8 } },
+    });
+    expect(result.success).toBe(true);
+    expect(VkConfigSchema.safeParse({ streaming: { mode: "off" } }).success).toBe(true);
+  });
+
+  it("rejects streaming modes VK does not implement", () => {
+    for (const mode of ["partial", "block", "preview"]) {
+      expect(VkConfigSchema.safeParse({ streaming: { mode } }).success).toBe(false);
+    }
+  });
+
+  it("rejects streaming under an account", () => {
+    const result = VkConfigSchema.safeParse({
+      accounts: { work: { token: "tok", streaming: { mode: "progress" } } },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
+  });
 });
 
 // ── Transport ────────────────────────────────────────────────────────────────
