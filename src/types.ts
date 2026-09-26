@@ -60,6 +60,9 @@ export type VkInboundForward = {
   senderId: number;
   /** When it was originally sent, in milliseconds. */
   timestamp?: number;
+  /** VK ids of the original, when VK sends them: enough to look it up again. */
+  messageId?: number;
+  conversationMessageId?: number;
   text: string;
   attachments?: VkInboundAttachment[];
   forwards?: VkInboundForward[];
@@ -77,6 +80,8 @@ export type VkInboundMessage = {
   attachments?: VkInboundAttachment[];
   replyToMessageId?: string;
   replyToText?: string;
+  /** When the quoted message was sent, in milliseconds. */
+  replyToTimestamp?: number;
   /** Author of the quoted message; negative for a community. */
   replyToSenderId?: number;
   /** Messages forwarded into this one. */

@@ -6,6 +6,7 @@ import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
   extractVkInboundForwards,
+  formatVkTimestamp,
   loadVkOutboundMedia,
   resolveVkInboundAgentText,
   resolveVkInboundBodyText,
@@ -17,6 +18,10 @@ import {
   resolveVkInboundMediaUrls,
   resolveVkInboundReplyContext,
 } from "./media.js";
+
+vi.mock("openclaw/plugin-sdk/core", async () => ({
+  formatZonedTimestamp: (await import("./test-helpers.js")).formatZonedTimestampLikeCore,
+}));
 
 const mockFetch = vi.fn();
 vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
@@ -459,6 +464,7 @@ describe("shared wall posts", () => {
     expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
       replyToMessageId: "9533",
       replyToText: "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+      replyToTimestamp: 1000,
       replyToSenderId: 1,
     });
   });
@@ -468,8 +474,14 @@ describe("shared wall posts", () => {
     expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
       replyToMessageId: "9520",
       replyToText: "<media:image>",
+      replyToTimestamp: 1000,
       replyToSenderId: 1,
     });
+  });
+
+  it("keeps the date of a quote, so the agent can place it in history", () => {
+    const replyMessage = vkReplyMessage({ id: 10610, text: "", date: 1_789_000_000, attachments: [WALL_PHOTO] });
+    expect(resolveVkInboundReplyContext(replyMessage).replyToTimestamp).toBe(1_789_000_000_000);
   });
 
   it("reads the author of a quote from vk-io, a community as a negative id", () => {
@@ -1059,6 +1071,39 @@ describe("forwarded messages", () => {
         "глубже",
       ].join("\n"),
     );
+  });
+});
+
+describe("forwarded messages — time and ids", () => {
+  it("writes the time of a forward in the configured timezone, not UTC", () => {
+    const forwards = extractVkInboundForwards(vkForwards([ORDER_FORWARD]));
+    const text = (timezone: string) =>
+      resolveVkInboundAgentText({ text: "", forwards, envelope: { timezone } });
+    expect(text("Europe/Moscow")).toContain("[Forwarded from vk:-142153191 at 2026-09-10 03:26 GMT+3]");
+    expect(text("Asia/Vladivostok")).toContain("at 2026-09-10 10:26 GMT+10]");
+    expect(text("utc")).toContain("at 2026-09-10 00:26 UTC]");
+  });
+
+  it("falls back to ISO without envelope options or on a zone that cannot be formatted", () => {
+    const ms = 1_789_000_000_000;
+    expect(formatVkTimestamp(ms)).toBe("2026-09-10T00:26:40.000Z");
+    expect(formatVkTimestamp(ms, { timezone: "Mars/Olympus" })).toBe("2026-09-10T00:26:40.000Z");
+  });
+
+  it("names the ids VK gives a forward, so it can be looked up again", () => {
+    const forwards = extractVkInboundForwards(
+      vkForwards([{ ...ORDER_FORWARD, id: 10610, conversation_message_id: 5321 }]),
+    );
+    expect(forwards[0]).toMatchObject({ messageId: 10610, conversationMessageId: 5321 });
+    expect(resolveVkInboundAgentText({ text: "", forwards })).toContain(
+      "[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z, message_id:10610, cmid:5321]",
+    );
+  });
+
+  it("leaves out ids VK withholds", () => {
+    const forwards = extractVkInboundForwards(vkForwards([{ ...ORDER_FORWARD, id: 0 }]));
+    expect(forwards[0].messageId).toBeUndefined();
+    expect(resolveVkInboundAgentText({ text: "", forwards })).not.toContain("message_id");
   });
 });
 

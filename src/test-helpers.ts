@@ -3,6 +3,36 @@ import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { vi } from "vitest";
 import type { ResolvedVkAccount, VkInboundMessage } from "./types.js";
 
+// Mirrors the core's formatZonedTimestamp (plugin-sdk/core), so tests can mock the SDK
+// without the core installed and still assert times as the core formats them.
+export function formatZonedTimestampLikeCore(
+  date: Date,
+  options?: { timeZone?: string },
+): string | undefined {
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: options?.timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+        timeZoneName: "short",
+      })
+        .formatToParts(date)
+        .map(({ type, value }) => [type, value]),
+    );
+    const { year, month, day, hour, minute } = parts;
+    const tz = parts.timeZoneName?.trim();
+    if (!year || !month || !day || !hour || !minute) return undefined;
+    return `${year}-${month}-${day} ${hour}:${minute}${tz ? ` ${tz}` : ""}`;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createVkRuntimeEnv(): RuntimeEnv {
   return {
     log: () => {},
@@ -97,7 +127,8 @@ export function makeVkRuntime(opts: {
         resolveSessionFilePath: vi.fn(),
       },
       reply: {
-        resolveEnvelopeFormatOptions: vi.fn().mockReturnValue({}),
+        // An explicit zone keeps prompt times independent of the machine running the tests.
+        resolveEnvelopeFormatOptions: vi.fn().mockReturnValue({ timezone: "UTC" }),
         formatAgentEnvelope: vi
           .fn()
           .mockReturnValue("[VK] from: vk:123456\n\nhello"),

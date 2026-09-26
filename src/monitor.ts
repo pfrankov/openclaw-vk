@@ -344,6 +344,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       attachments,
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
+      ...(replyContext.replyToTimestamp !== undefined ? { replyToTimestamp: replyContext.replyToTimestamp } : {}),
       replyToSenderId: replyContext.replyToSenderId,
       ...(forwards.length > 0 ? { forwards } : {}),
       replyToForwards: replyContext.replyToForwards,

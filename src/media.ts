@@ -1,7 +1,8 @@
 import { readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { PluginRuntime } from "openclaw/plugin-sdk/core";
+import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
+import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -502,6 +503,14 @@ function readVkForwards(raw: unknown, depth: number): VkInboundForward[] {
     if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
       forward.timestamp = createdAt * 1000;
     }
+    const messageId = readVkId(record.id);
+    if (messageId !== undefined) {
+      forward.messageId = messageId;
+    }
+    const conversationMessageId = readVkId(record.conversationMessageId);
+    if (conversationMessageId !== undefined) {
+      forward.conversationMessageId = conversationMessageId;
+    }
     const attachments = extractVkInboundAttachments(record.attachments);
     if (attachments.length > 0) {
       forward.attachments = attachments;
@@ -512,6 +521,11 @@ function readVkForwards(raw: unknown, depth: number): VkInboundForward[] {
     }
     return [forward];
   });
+}
+
+/** A VK message id: forwards carry 0 or nothing when VK withholds it. */
+function readVkId(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 /**
@@ -538,6 +552,8 @@ export function capVkForwards(forwards: readonly VkInboundForward[]): VkInboundF
 export function resolveVkInboundReplyContext(replyMessage: unknown): {
   replyToMessageId?: string;
   replyToText?: string;
+  /** When the quoted message was sent, in milliseconds. */
+  replyToTimestamp?: number;
   replyToForwards?: VkInboundForward[];
   /** Author of the quoted message; negative for a community. */
   replyToSenderId?: number;
@@ -560,9 +576,14 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
   const replyToForwards = extractVkInboundForwards(record.forwards);
   const replyToSenderId =
     typeof record.senderId === "number" && record.senderId !== 0 ? record.senderId : undefined;
+  const replyToTimestamp =
+    typeof record.createdAt === "number" && Number.isFinite(record.createdAt) && record.createdAt > 0
+      ? record.createdAt * 1000
+      : undefined;
   return {
     replyToMessageId,
     replyToText,
+    ...(replyToTimestamp !== undefined ? { replyToTimestamp } : {}),
     ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
     ...(replyToSenderId !== undefined ? { replyToSenderId } : {}),
   };
@@ -755,27 +776,63 @@ export function resolveVkInboundBodyText(params: {
   return `<media:${mediaKinds[0] ?? "attachment"}>`;
 }
 
-/** A forward as the agent sees it: author and date, then its own body. */
-function describeVkForward(forward: VkInboundForward): string {
-  const at = forward.timestamp !== undefined ? ` at ${new Date(forward.timestamp).toISOString()}` : "";
+/**
+ * A time in the zone the core writes the message's own in: the configured
+ * `agents.defaults.userTimezone`, else the host's. Minutes are enough for a
+ * forward. Without envelope options, or if the zone cannot be formatted, plain
+ * ISO in UTC as before.
+ */
+export function formatVkTimestamp(ms: number, envelope?: EnvelopeFormatOptions): string {
+  const date = new Date(ms);
+  if (!envelope) {
+    return date.toISOString();
+  }
+  return formatZonedTimestamp(date, { timeZone: resolveVkTimeZone(envelope) }) ?? date.toISOString();
+}
+
+/** `resolveEnvelopeFormatOptions` gives a checked IANA zone, "local" or nothing. */
+function resolveVkTimeZone(envelope: EnvelopeFormatOptions): string | undefined {
+  const configured = envelope.timezone?.trim();
+  const lowered = configured?.toLowerCase();
+  if (!configured || lowered === "local" || lowered === "host") {
+    return undefined;
+  }
+  if (lowered === "utc" || lowered === "gmt") {
+    return "UTC";
+  }
+  return configured;
+}
+
+/** A forward as the agent sees it: author, date and ids, then its own body. */
+function describeVkForward(forward: VkInboundForward, envelope?: EnvelopeFormatOptions): string {
+  const at = forward.timestamp !== undefined ? ` at ${formatVkTimestamp(forward.timestamp, envelope)}` : "";
+  const ids = [
+    forward.messageId !== undefined ? `message_id:${forward.messageId}` : undefined,
+    forward.conversationMessageId !== undefined ? `cmid:${forward.conversationMessageId}` : undefined,
+  ].filter(Boolean);
+  const idLabel = ids.length > 0 ? `, ${ids.join(", ")}` : "";
   const body = resolveVkInboundAgentText({ text: forward.text, attachments: forward.attachments });
-  const own = [`[Forwarded from vk:${forward.senderId}${at}]`, body].filter(Boolean).join("\n");
-  return [own, ...(forward.forwards ?? []).map(describeVkForward)].join("\n\n");
+  const own = [`[Forwarded from vk:${forward.senderId}${at}${idLabel}]`, body].filter(Boolean).join("\n");
+  return [own, ...(forward.forwards ?? []).map((nested) => describeVkForward(nested, envelope))].join(
+    "\n\n",
+  );
 }
 
 /**
  * The body the agent sees: the sender’s text plus any post shared with it and
- * any messages forwarded into it. The caller decides which forwards are visible.
+ * any messages forwarded into it. The caller decides which forwards are visible;
+ * `envelope` puts forward times in the user's timezone.
  */
 export function resolveVkInboundAgentText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
   forwards?: readonly VkInboundForward[];
+  envelope?: EnvelopeFormatOptions;
 }): string {
   const posts = (params.attachments ?? []).flatMap((attachment) =>
     attachment.post ? [describeVkWallPost(attachment.post)] : [],
   );
-  const forwarded = (params.forwards ?? []).map(describeVkForward);
+  const forwarded = (params.forwards ?? []).map((forward) => describeVkForward(forward, params.envelope));
   const own =
     posts.length > 0
       ? [params.text?.trim() ?? "", ...posts]
