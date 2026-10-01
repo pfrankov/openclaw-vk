@@ -862,6 +862,34 @@ describe("directory", () => {
 // ── Outbound ─────────────────────────────────────────────────────────────────
 
 describe("outbound", () => {
+  it("normalizePayload moves a question's buttons out of the presentation, keeping the core's text", () => {
+    const questionId = `ask_${"e".repeat(32)}`;
+    const payload = {
+      text: "Question for you:\n\nАпскейл\nКакой размер?\n1. ×2\n2. ×4",
+      presentationTextMode: "fallback",
+      presentation: {
+        blocks: [
+          {
+            type: "buttons",
+            buttons: [
+              { label: "×2", action: { type: "question", questionId, optionValue: "×2" } },
+              { label: "×4", action: { type: "question", questionId, optionValue: "×4" } },
+            ],
+          },
+        ],
+      },
+      channelData: { askUser: { questionId } },
+    };
+    const normalized = vkPlugin.outbound!.normalizePayload!({ payload, cfg: {} } as never);
+    expect(normalized).toEqual({
+      text: payload.text,
+      channelData: { askUser: { questionId }, vkQuestion: { options: ["×2", "×4"], customInput: false } },
+    });
+    // Anything else passes through untouched.
+    const ordinary = { text: "hi" };
+    expect(vkPlugin.outbound!.normalizePayload!({ payload: ordinary, cfg: {} } as never)).toBe(ordinary);
+  });
+
   it("sendPayload passes replyToId and mediaLocalRoots through to VK", async () => {
     const result = await vkPlugin.outbound!.sendPayload({
       cfg: {},

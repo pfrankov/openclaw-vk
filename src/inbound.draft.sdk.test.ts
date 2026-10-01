@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { VkInboundMessage } from "./types.js";
 
 /**
@@ -84,6 +84,12 @@ vi.mock("./send.js", async (importOriginal) => {
   sendPayloadVk: vi.fn(
     async (to: string, payload: Record<string, unknown>, opts?: { clearKeyboard?: boolean }) => {
     chat.payloadCalls.push(payload);
+    // A question takes the REAL send path — the one that moves the draft out
+    // of its way — down to VK's API, which is the fake chat below.
+    const channelData = payload.channelData as { askUser?: unknown } | undefined;
+    if (channelData?.askUser) {
+      return await actual.sendPayloadVk(to, payload as never, opts);
+    }
     if (chat.failSendPayload) {
       throw new Error("VK API error 10: upload failed");
     }
@@ -113,6 +119,26 @@ vi.mock("./send.js", async (importOriginal) => {
   };
 });
 
+// VK's API, for the one real send path above (questions): into the same chat.
+vi.mock("vk-io", () => ({
+  VK: vi.fn().mockImplementation(function () {
+    return {
+      api: {
+        messages: {
+          send: vi.fn(async (params: { message: string }) => {
+            const id = chat.nextId++;
+            chat.messages.push({ id, text: params.message, media: [] });
+            return id;
+          }),
+        },
+      },
+    };
+  }),
+  getRandomId: () => 1,
+  // monitor.ts (through channel.ts) extends it at load; never started here.
+  PollingTransport: class {},
+}));
+
 // ── The agent run: each test scripts what the core delivers ─────────────────
 
 type Scenario = (args: {
@@ -134,6 +160,15 @@ const runtimeModule: typeof import("./runtime.js") | null = sdkInstalled
   : null;
 const helpers: typeof import("./test-helpers.js") | null = sdkInstalled
   ? await import("./test-helpers.js")
+  : null;
+const channel: typeof import("./channel.js") | null = sdkInstalled
+  ? await import("./channel.js")
+  : null;
+const questionModule: typeof import("./question.js") | null = sdkInstalled
+  ? await import("./question.js")
+  : null;
+const coreQuestions = sdkInstalled
+  ? await import("openclaw/plugin-sdk/question-gateway-runtime")
   : null;
 
 const LABEL = "⏳ Работаю";
@@ -193,6 +228,8 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     ) => {
       await run.scenario?.(args);
     }) as never;
+    // The real question send path reads the live config for the VK token.
+    vi.mocked(runtime.config.current).mockReturnValue(progressCfg() as never);
     runtimeModule!.setVkRuntime(runtime);
   });
 
@@ -558,4 +595,303 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(texts()).toEqual(["Ответ блоками."]);
     });
   });
+
+  // ── A question from the core holds the turn: it must stay its own message ─
+
+  describe("question from the core (ask_user / AskUserQuestion) during a turn", () => {
+    const QID = `ask_${"d".repeat(32)}`;
+    const question = {
+      text: "Question for you:\n\nАпскейл\nКакой размер?\n1. ×2\n2. ×4",
+      presentationTextMode: "fallback",
+      presentation: {
+        blocks: [
+          { type: "text", text: "Какой размер?" },
+          {
+            type: "buttons",
+            buttons: [
+              { label: "×2", action: { type: "question", questionId: QID, optionValue: "×2" } },
+              { label: "×4", action: { type: "question", questionId: QID, optionValue: "×4" } },
+            ],
+          },
+        ],
+      },
+      channelData: { askUser: { questionId: QID, optionValues: ["×2", "×4"] } },
+    };
+
+    for (const kind of ["block", "tool"] as const) {
+      it(`a ${kind} question goes out as its own message with its presentation, not into the draft`, async () => {
+        await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+          await replyOptions.onToolStart?.(toolStart());
+          await dispatcherOptions.deliver(question, { kind });
+          // The next tool step redraws the draft; the question must survive it.
+          await replyOptions.onToolStart?.(toolStart("render"));
+          await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+        });
+        const sent = chat.payloadCalls.find((payload) => payload.channelData);
+        // Handed to sendPayloadVk whole: it builds the keyboard from these.
+        expect(sent?.channelData).toEqual(question.channelData);
+        expect(sent?.presentation).toEqual(question.presentation);
+        // Not labelled as progress: it is a question, not a step.
+        expect(String(sent?.text).startsWith(LABEL)).toBe(false);
+        // The step list above the question is gone; the steps after it and
+        // the answer land below it, in the order they happened.
+        expect(texts()).toEqual([question.text, "Готово."]);
+      });
+    }
+
+    it("steps after the question are drawn in a fresh draft below it", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver(question, { kind: "tool" });
+        await replyOptions.onToolStart?.(toolStart("render"));
+        during = texts();
+      });
+      expect(during).toHaveLength(2);
+      expect(during[0]).toBe(question.text);
+      expect(during[1]?.startsWith(LABEL)).toBe(true);
+    });
+
+    /**
+     * `ask_user` over MCP — the production path: the core sends the question
+     * as an outbound send (`normalizePayload` → `sendPayload`), never through
+     * this turn's `deliver`. 24.09 the draft stayed above it and the final
+     * answer was edited into it, above the question.
+     */
+    const sendOutbound = async (payload: Record<string, unknown>) => {
+      const outbound = channel!.vkPlugin.outbound!;
+      const cfg = progressCfg();
+      const normalized = outbound.normalizePayload!({ payload, cfg } as never) ?? payload;
+      await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+    };
+
+    it("a question sent as an outbound send moves the draft below it too", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await sendOutbound(question);
+        during = texts();
+        await replyOptions.onToolStart?.(toolStart("render"));
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      // The bare step list is gone the moment the question goes out.
+      expect(during).toEqual([question.text]);
+      expect(texts()).toEqual([question.text, "Готово."]);
+    });
+
+    it("an outbound question keeps the answer already in the draft, above it", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Сначала посмотрю варианты." }, { kind: "block" });
+        await sendOutbound(question);
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(texts()).toEqual(["Сначала посмотрю варианты.", question.text, "Готово."]);
+    });
+
+    it("an ordinary outbound send leaves the draft alone", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await sendOutbound({ text: "🍬 Рендер готов" });
+        during = texts();
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(during).toHaveLength(2);
+      expect(during[0]?.startsWith(LABEL)).toBe(true);
+      expect(during[1]).toBe("🍬 Рендер готов");
+      // The draft took the final, as before: it is the first message.
+      expect(texts()).toEqual(["Готово.", "🍬 Рендер готов"]);
+    });
+
+    it("a question to another chat leaves this turn's draft alone", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        await outbound.sendPayload!({ cfg, to: "vk:999", payload: question, accountId: "default" } as never);
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(texts()).toEqual(["Готово.", question.text]);
+    });
+
+    it("after the turn ends, a question no longer touches its (finished) draft", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      await sendOutbound(question);
+      expect(texts()).toEqual(["Готово.", question.text]);
+    });
+
+    it("the answer blocks already in the draft stay above the question", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Сначала посмотрю варианты." }, { kind: "block" });
+        await dispatcherOptions.deliver(question, { kind: "block" });
+      });
+      expect(texts()).toEqual(["Сначала посмотрю варианты.", question.text]);
+    });
+  });
 });
+
+// ── A typed answer to an open question never becomes a turn ─────────────────
+
+describe.skipIf(!inbound || !channel || !questionModule || !coreQuestions)(
+  "typed answer to a question sent as an outbound send (ask_user over MCP)",
+  () => {
+    const QID = `ask_${"c".repeat(32)}`;
+    const question = {
+      text: "Question for you:\n\nФон\nКакой фон?\n1. Белый\n2. Чёрный\n3. Серый",
+      presentationTextMode: "fallback",
+      presentation: {
+        blocks: [
+          {
+            type: "buttons",
+            buttons: ["Белый", "Чёрный", "Серый"].map((label) => ({
+              label,
+              action: { type: "question", questionId: QID, optionValue: label },
+            })),
+          },
+        ],
+      },
+      channelData: { askUser: { questionId: QID } },
+    };
+    const resolveOption = vi.fn();
+    let dispatched: string[] = [];
+
+    const incoming = (text: string) =>
+      inbound!.handleVkInbound({
+        message: helpers!.makeMessage({ conversationMessageId: 43, messageId: "m2", text }),
+        account: helpers!.makeAccount({ config: { dmPolicy: "open", allowFrom: ["*"] } }),
+        config: progressCfg() as never,
+        runtime: helpers!.createVkRuntimeEnv(),
+      });
+
+    beforeEach(async () => {
+      chat.messages = [];
+      chat.payloadCalls = [];
+      dispatched = [];
+      resolveOption.mockReset();
+      // This block is not under the shared beforeEach: set its own runtime.
+      const runtime = helpers!.makeVkRuntime();
+      runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher = (async (
+        args: Parameters<Scenario>[0],
+      ) => {
+        await run.scenario?.(args);
+      }) as never;
+      vi.mocked(runtime.config.current).mockReturnValue(progressCfg() as never);
+      // The core's own command detection, so /new is known for what it is.
+      runtime.channel.text.hasControlCommand = (
+        await import("openclaw/plugin-sdk/command-auth-native")
+      ).hasControlCommand as never;
+      runtimeModule!.setVkRuntime(runtime);
+      questionModule!.clearVkQuestionDeliveries();
+      // The core's runtime, except the call that needs a hosted gateway.
+      questionModule!.resetVkQuestionRuntimeForTest({
+        runtime: { ...coreQuestions!.questionGatewayRuntime, resolveOption } as never,
+      });
+      // The question goes out the production way, during a turn.
+      await runTurn(async () => {
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        const normalized = outbound.normalizePayload!({ payload: question, cfg } as never) ?? question;
+        await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+      });
+      run.scenario = async () => {
+        dispatched.push("turn");
+      };
+    });
+
+    afterEach(() => {
+      questionModule!.clearVkQuestionDeliveries();
+      questionModule!.resetVkQuestionRuntimeForTest();
+    });
+
+    it("«3» answers the question and does not reach the core as a turn", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Серый" });
+      await incoming("3");
+      expect(resolveOption).toHaveBeenCalledTimes(1);
+      expect(resolveOption.mock.calls[0][0]).toMatchObject({ questionId: QID, optionValue: "Серый" });
+      expect(dispatched).toEqual([]);
+    });
+
+    it("an option's text answers too", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Чёрный" });
+      await incoming("чёрный");
+      expect(resolveOption.mock.calls[0][0].optionValue).toBe("Чёрный");
+      expect(dispatched).toEqual([]);
+    });
+
+    it("a message that is not an answer goes on as a turn", async () => {
+      await incoming("подожди, а зачем фон?");
+      expect(resolveOption).not.toHaveBeenCalled();
+      expect(dispatched).toEqual(["turn"]);
+    });
+
+    it("a stop word or a control command stays a command, even where any text answers", async () => {
+      // As every ask_user question: its own answer allowed, so free text answers it.
+      const QID2 = `ask_${"d".repeat(32)}`;
+      const own = {
+        ...question,
+        presentation: {
+          blocks: [
+            {
+              type: "buttons",
+              buttons: [
+                ...["Белый", "Чёрный"].map((label) => ({
+                  label,
+                  action: { type: "question", questionId: QID2, optionValue: label },
+                })),
+                { label: "Свой вариант", action: { type: "question", questionId: QID2, intent: "custom-input" } },
+              ],
+            },
+          ],
+        },
+        channelData: { askUser: { questionId: QID2 } },
+      };
+      questionModule!.clearVkQuestionDeliveries();
+      await runTurn(async () => {
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        const normalized = outbound.normalizePayload!({ payload: own, cfg } as never) ?? own;
+        await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+      });
+      resolveOption.mockResolvedValue({ status: "denied" });
+      await incoming("стоп");
+      await incoming("/stop");
+      await incoming("/new");
+      expect(resolveOption).not.toHaveBeenCalled();
+      // Sanity: the same question takes ordinary free text.
+      await incoming("что-то своё");
+      expect(resolveOption.mock.calls[0][0]).toMatchObject({ questionId: QID2, optionValue: "что-то своё" });
+    });
+
+    it("in a group chat typed text is not taken as an answer", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Серый" });
+      await inbound!.handleVkInbound({
+        message: helpers!.makeMessage({
+          conversationMessageId: 44,
+          messageId: "m3",
+          text: "3",
+          isGroup: true,
+        }),
+        account: helpers!.makeAccount({
+          config: { dmPolicy: "open", allowFrom: ["*"], groupPolicy: "open" },
+        }),
+        config: progressCfg() as never,
+        runtime: helpers!.createVkRuntimeEnv(),
+      });
+      expect(resolveOption).not.toHaveBeenCalled();
+    });
+
+    it("an answer the core refuses (already answered) goes on as a turn", async () => {
+      resolveOption.mockResolvedValue({ status: "already-terminal", reason: "already-terminal" });
+      await incoming("2");
+      expect(dispatched).toEqual(["turn"]);
+      // Closed here now: the next «2» is not even tried.
+      await incoming("2");
+      expect(resolveOption).toHaveBeenCalledTimes(1);
+    });
+  },
+);

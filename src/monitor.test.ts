@@ -163,6 +163,9 @@ vi.mock("./inbound.js", () => ({ handleVkInbound: mockHandleVkInbound }));
 const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 
+const mockHandleVkQuestionEvent = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+vi.mock("./question-events.js", () => ({ handleVkQuestionEvent: mockHandleVkQuestionEvent }));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function baseCfg(): CoreConfig {
@@ -529,6 +532,54 @@ describe("stop/abort", () => {
 
     // The finally block already called stopUpdates; a second abort should be a no-op.
     expect(mockPollingTransportStop).toHaveBeenCalledOnce();
+  });
+});
+
+// ── message_event handler (question buttons) ─────────────────────────────────
+
+describe("message_event handler", () => {
+  function getEventHandler(): (ctx: Record<string, unknown>) => Promise<void> {
+    const call = mockUpdatesOn.mock.calls.find(([event]) => event === "message_event");
+    if (!call) {
+      throw new Error("message_event handler was not registered");
+    }
+    return call[1] as (ctx: Record<string, unknown>) => Promise<void>;
+  }
+
+  it("hands a pressed callback button to the question handler with this account", async () => {
+    mockHandleVkQuestionEvent.mockReset().mockResolvedValue(true);
+    const runtime = createVkRuntimeEnv();
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+
+    const ctx = { userId: 1, peerId: 1, eventPayload: { ocq: "x" }, answer: vi.fn() };
+    await getEventHandler()(ctx);
+
+    expect(mockHandleVkQuestionEvent).toHaveBeenCalledOnce();
+    expect(mockHandleVkQuestionEvent.mock.calls[0][0]).toMatchObject({ event: ctx, accountId: "default" });
+    expect(mockHandleVkQuestionEvent.mock.calls[0][0].runtime).toBe(runtime);
+  });
+
+  it("logs a failing handler instead of breaking the update loop", async () => {
+    mockHandleVkQuestionEvent.mockReset().mockRejectedValue(new Error("boom"));
+    const runtime = { ...createVkRuntimeEnv(), error: vi.fn() };
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+
+    await expect(getEventHandler()({ userId: 1, peerId: 1 })).resolves.toBeUndefined();
+    expect(runtime.error).toHaveBeenCalledWith(expect.stringContaining("message_event handler error: boom"));
+  });
+
+  it("ignores presses after stop was requested", async () => {
+    mockHandleVkQuestionEvent.mockReset().mockResolvedValue(true);
+    activeMonitor = startMonitor();
+    await flush();
+    const handler = getEventHandler();
+    activeMonitor.controller.abort();
+    await flush();
+
+    await handler({ userId: 1, peerId: 1 });
+    expect(mockHandleVkQuestionEvent).not.toHaveBeenCalled();
   });
 });
 

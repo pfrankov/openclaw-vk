@@ -8,6 +8,33 @@ export function isVkGroupPeerId(peerId: string | number): boolean {
   return Number.isFinite(numericPeerId) && numericPeerId >= VK_GROUP_CHAT_OFFSET;
 }
 
+/** Allowlist entries as the checks compare them: trimmed, lower-case, no blanks. */
+export function normalizeVkAllowlist(allowFrom: Array<string | number> | undefined): string[] {
+  if (!allowFrom) {
+    return [];
+  }
+  return allowFrom.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * Whether a sender passes an allowlist: exact id, `vk:`-prefixed id, or `*`.
+ * An empty list admits nobody — callers decide what an empty list means.
+ */
+export function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number }): {
+  allowed: boolean;
+} {
+  const senderStr = String(params.senderId);
+  if (params.allowFrom.length === 0) {
+    return { allowed: false };
+  }
+  if (params.allowFrom.includes("*")) {
+    return { allowed: true };
+  }
+  return {
+    allowed: params.allowFrom.some((entry) => entry === senderStr || entry === `vk:${senderStr}`),
+  };
+}
+
 export function normalizeVkTargetId(value: string | number): string {
   return String(value).trim().replace(/^vk:(?:user:|chat:)?/i, "");
 }

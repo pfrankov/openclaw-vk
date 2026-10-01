@@ -14,6 +14,7 @@ import {
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
+import { handleVkQuestionEvent } from "./question-events.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkAccountConfig, VkInboundMessage } from "./types.js";
 
@@ -375,6 +376,26 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       opts.runtime.error?.(`vk: message handler error for peerId=${redactVkId(peerId)}: ${errorMessage}`);
+    }
+  });
+
+  // A pressed inline callback button. Only question buttons exist today (see
+  // question.ts); the community must have the `message_event` Long Poll event
+  // enabled, or presses never arrive and the button keeps spinning.
+  vk.updates.on("message_event", async (context) => {
+    if (stopRequested) {
+      return;
+    }
+    opts.setStatus?.({ lastEventAt: Date.now() });
+    try {
+      await handleVkQuestionEvent({
+        event: context,
+        accountId: account.accountId,
+        runtime: opts.runtime,
+      });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      opts.runtime.error?.(`vk: message_event handler error: ${errorMessage}`);
     }
   });
 

@@ -20,9 +20,21 @@ import {
 } from "./format.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
+import {
+  buildVkQuestionKeyboard,
+  buildVkQuestionKeyboardRemoval,
+  formatVkQuestionStatusLine,
+  handOffVkDraftsBeforeQuestion,
+  loadVkQuestionRuntime,
+  markVkQuestionTerminal,
+  readVkQuestionPrompt,
+  rememberVkQuestionDelivery,
+  type VkQuestionPrompt,
+  withoutVkQuestionReplyGuidance,
+} from "./question.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { vkPositiveSetting } from "./settings.js";
-import { normalizeVkTargetId } from "./send-support.js";
+import { isVkGroupPeerId, normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
   applyVkAllowlistConfigEdit,
@@ -146,6 +158,12 @@ export type SendVkOptions = {
   replyTo?: string;
   buttons?: VkReplyButtons;
   clearKeyboard?: boolean;
+  /**
+   * A keyboard already serialized for VK, for the last message. Question
+   * prompts use it: their inline callback buttons are not `VkReplyButtons`,
+   * which describe text buttons carrying a command.
+   */
+  keyboard?: string;
   mediaLocalRoots?: readonly string[];
   forceDocument?: boolean;
 };
@@ -657,6 +675,9 @@ function toPreparedVkMessages(
 }
 
 function resolveVkKeyboard(opts: SendVkOptions): string | undefined {
+  if (opts.keyboard) {
+    return opts.keyboard;
+  }
   return opts.clearKeyboard === true ? buildVkKeyboardRemoval() : buildVkKeyboard(opts.buttons);
 }
 
@@ -1854,7 +1875,7 @@ export async function editMessageVk(
   messageId: number,
   text: string,
   account: ResolvedVkAccount,
-  opts: { formatData?: VkPreparedFormattedMessage["formatData"] } = {},
+  opts: { formatData?: VkPreparedFormattedMessage["formatData"]; keyboard?: string } = {},
 ): Promise<boolean> {
   if (!account.token) {
     return false;
@@ -1875,6 +1896,9 @@ export async function editMessageVk(
   // param but not typed by vk-io, so build the params loosely and cast on the call.
   if (opts.formatData && opts.formatData.items.length > 0) {
     editParams.format_data = JSON.stringify(opts.formatData);
+  }
+  if (opts.keyboard) {
+    editParams.keyboard = opts.keyboard;
   }
   await withVkRetry(async () => {
     await vk.api.messages.edit(
@@ -1942,6 +1966,7 @@ async function sendMessageChunksVk(params: {
         replyTo: index === 0 ? params.opts.replyTo : undefined,
         buttons: isLast ? params.opts.buttons : undefined,
         clearKeyboard: isLast ? params.opts.clearKeyboard : undefined,
+        keyboard: isLast ? params.opts.keyboard : undefined,
       },
     });
     results.push(result);
@@ -2130,6 +2155,104 @@ async function sendPayloadResultsVk(params: {
   });
 }
 
+/**
+ * The status line appended to a finished question, within VK's message limit.
+ *
+ * It goes at the end, so the rich-text runs of the question keep their
+ * offsets. When the two no longer fit, the question text gives way, and runs
+ * that would point past its new end are dropped rather than sent broken.
+ */
+export function appendVkQuestionStatus(
+  message: VkPreparedFormattedMessage,
+  status: string,
+): VkPreparedFormattedMessage {
+  const separator = "\n\n";
+  const room = VK_MESSAGE_TEXT_LIMIT - separator.length - status.length;
+  const truncated = message.text.length > room;
+  const body = truncated ? message.text.slice(0, Math.max(0, room - 1)) : message.text;
+  const items =
+    message.formatData?.items.filter((item) => item.offset + item.length <= body.length) ?? [];
+  return {
+    text: `${body}${truncated ? "…" : ""}${separator}${status}`,
+    ...(items.length > 0 ? { formatData: { version: 1 as const, items } } : {}),
+  };
+}
+
+/**
+ * A question from the core: its text, and under it one button per option.
+ *
+ * The keyboard goes on the last message of the prompt, and that message is
+ * handed to the core's question runtime: when the question is answered,
+ * expires or is cancelled, the core calls `finalize` with a status line, and
+ * the message is edited to carry it. The edit sends an empty inline keyboard,
+ * so the buttons go away and a finished question cannot be pressed again.
+ *
+ * Without the runtime (a core older than 2026.9.6) the prompt goes out as plain
+ * text, exactly as before.
+ */
+async function sendVkQuestionPayload(params: {
+  to: string;
+  text: string;
+  question: VkQuestionPrompt;
+  opts: SendVkOptions;
+}): Promise<SendVkResult | null> {
+  const runtime = await loadVkQuestionRuntime();
+  const { account, peerId } = await resolveSendTarget({
+    cfg: params.opts.cfg,
+    accountId: params.opts.accountId,
+    to: params.to,
+  });
+  const accountId = account.accountId;
+  // A group chat answers by buttons only: a typed message there is never taken
+  // as an answer (see `inbound.ts`), so "Свой вариант" would lead nowhere.
+  const inGroup = isVkGroupPeerId(peerId);
+  const question = inGroup ? { ...params.question, customInput: false } : params.question;
+  const keyboard = runtime ? buildVkQuestionKeyboard(question) : undefined;
+  // The turn waiting on this question moves its step draft out of the way
+  // first, so the question is the last message and what follows lands below.
+  await handOffVkDraftsBeforeQuestion({ accountId, peerId });
+  // Cut before chunking, so `finalize` edits the same text that went out.
+  const chunks = prepareVkMessageChunks(inGroup ? withoutVkQuestionReplyGuidance(params.text) : params.text);
+  const results = await sendMessageChunksVk({
+    to: params.to,
+    chunks,
+    opts: { ...params.opts, buttons: undefined, clearKeyboard: undefined, keyboard },
+  });
+  const last = getLastSendResult(results);
+  const lastChunk = chunks.at(-1);
+  const messageId = Number(last?.messageId);
+  vkDiag("question sent", {
+    questionId: question.questionId,
+    options: question.options.length,
+    customInput: question.customInput,
+    keyboard: Boolean(keyboard),
+    messageId: last?.messageId ?? null,
+  });
+  if (!runtime || !last || !lastChunk || !Number.isFinite(messageId) || messageId <= 0) {
+    return last;
+  }
+  const questionId = params.question.questionId;
+  // Remembered before registering: the core finalizes an already-finished
+  // question synchronously inside `registerChannelDelivery`.
+  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, question);
+  runtime.registerChannelDelivery({
+    questionId,
+    deliveryId: `vk:${accountId}:${peerId}:${messageId}`,
+    finalize: async (statusLine) => {
+      markVkQuestionTerminal(questionId);
+      const current = resolveVkAccount({ cfg: readVkRuntimeConfig(), accountId });
+      const finished = appendVkQuestionStatus(lastChunk, formatVkQuestionStatusLine(statusLine));
+      await editMessageVk(String(peerId), messageId, finished.text, current, {
+        formatData: finished.formatData,
+        // Only a prompt that had buttons: a text-only one is edited as before.
+        keyboard: keyboard ? buildVkQuestionKeyboardRemoval() : undefined,
+      });
+      vkDiag("question finalized", { questionId, messageId, status: statusLine });
+    },
+  });
+  return last;
+}
+
 export async function sendPayloadVk(
   to: string,
   payload: VkOutboundPayloadLike,
@@ -2142,6 +2265,12 @@ export async function sendPayloadVk(
     mediaRefs: (mediaRefs ?? []).map((r) => r?.url),
     textLen: (text ?? "").length,
   });
+
+  // A question prompt carries no media: it is text the person answers.
+  const question = readVkQuestionPrompt(payload);
+  if (question && text && mediaRefs.length === 0) {
+    return await sendVkQuestionPayload({ to, text, question, opts: { ...opts, replyTo } });
+  }
 
   return getLastSendResult(
     await sendPayloadResultsVk({

@@ -1,5 +1,6 @@
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth-native";
 import { getReplyPayloadTtsSupplement } from "openclaw/plugin-sdk/reply-payload";
+import { isAbortRequestText } from "openclaw/plugin-sdk/reply-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { StreamingCompatEntry } from "./sdk-compat.js";
 import {
@@ -27,8 +28,6 @@ import {
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import {
   GROUP_POLICY_BLOCKED_LABEL,
-  resolveAllowlistProviderRuntimeGroupPolicy,
-  resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
@@ -46,6 +45,10 @@ import {
   type VkProgressDraftHandle,
 } from "./progress-draft.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
+import { readVkAskUserQuestionId, registerVkDraftQuestionHandoff } from "./question.js";
+import { answerVkQuestionByText } from "./question-events.js";
+import { resolveVkGroupAccess, resolveVkGroupSenderAdmission } from "./group-access.js";
+import { normalizeVkAllowlist, resolveVkAllowlistMatch } from "./send-support.js";
 import { getVkRuntime } from "./runtime.js";
 import {
   editMessageVk,
@@ -73,13 +76,6 @@ const VK_GROUP_CHAT_OFFSET = 2_000_000_000;
 
 function isVkGroupChat(peerId: number): boolean {
   return peerId >= VK_GROUP_CHAT_OFFSET;
-}
-
-function normalizeVkAllowlist(allowFrom: Array<string | number> | undefined): string[] {
-  if (!allowFrom) {
-    return [];
-  }
-  return allowFrom.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean);
 }
 
 /** The core's precedence: account, then channel (merged into the account), then channel defaults. */
@@ -125,21 +121,6 @@ function collectVkForwardImages(forwards: readonly VkInboundForward[]): VkInboun
     ...(forward.attachments ?? []).filter((attachment) => attachment.kind === "image"),
     ...collectVkForwardImages(forward.forwards ?? []),
   ]);
-}
-
-function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number }): {
-  allowed: boolean;
-} {
-  const senderStr = String(params.senderId);
-  if (params.allowFrom.length === 0) {
-    return { allowed: false };
-  }
-  if (params.allowFrom.includes("*")) {
-    return { allowed: true };
-  }
-  return {
-    allowed: params.allowFrom.some((entry) => entry === senderStr || entry === `vk:${senderStr}`),
-  };
 }
 
 type VkInboundMediaKind = NonNullable<ChannelInboundMediaInput["kind"]>;
@@ -231,18 +212,12 @@ export async function handleVkInbound(params: {
 
   const senderDisplay = String(message.senderId);
   const isGroup = message.isGroup;
-  const groupConfig = isGroup
-    ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
-    : undefined;
+  // Shared with question buttons: both gates must admit the same senders.
+  const groupAccess = resolveVkGroupAccess({ config, account, peerId: message.peerId });
+  const groupConfig = isGroup ? groupAccess.groupConfig : undefined;
 
   const dmPolicy = account.config.dmPolicy ?? "pairing";
-  const defaultGroupPolicy = resolveDefaultGroupPolicy(config as OpenClawConfig);
-  const { groupPolicy, providerMissingFallbackApplied } =
-    resolveAllowlistProviderRuntimeGroupPolicy({
-      providerConfigPresent: config.channels?.vk !== undefined,
-      groupPolicy: account.config.groupPolicy,
-      defaultGroupPolicy,
-    });
+  const { groupPolicy, providerMissingFallbackApplied } = groupAccess;
   warnMissingProviderGroupPolicyFallbackOnce({
     providerMissingFallbackApplied,
     providerKey: "vk",
@@ -252,7 +227,6 @@ export async function handleVkInbound(params: {
   });
 
   const configAllowFrom = normalizeVkAllowlist(account.config.allowFrom);
-  const configGroupAllowFrom = normalizeVkAllowlist(account.config.groupAllowFrom);
   const storeAllowFrom = await readStoreAllowFromForDmPolicy({
     provider: CHANNEL_ID,
     accountId: account.accountId,
@@ -261,18 +235,13 @@ export async function handleVkInbound(params: {
   });
   const storeAllowList = normalizeVkAllowlist(storeAllowFrom);
 
-  const { effectiveAllowFrom, effectiveGroupAllowFrom } = resolveEffectiveAllowFromLists({
+  const { effectiveAllowFrom } = resolveEffectiveAllowFromLists({
     allowFrom: configAllowFrom,
-    groupAllowFrom: configGroupAllowFrom,
     storeAllowFrom: storeAllowList,
     dmPolicy,
     groupAllowFromFallbackToAllowFrom: false,
   });
-  const groupAllowOverride =
-    groupConfig && Object.hasOwn(groupConfig, "allowFrom")
-      ? normalizeVkAllowlist(groupConfig.allowFrom)
-      : undefined;
-  const effectiveGroupSenderAllowFrom = groupAllowOverride ?? effectiveGroupAllowFrom;
+  const { effectiveGroupAllowFrom, effectiveGroupSenderAllowFrom } = groupAccess;
 
   // Forwards follow the core's supplemental context visibility, as in Telegram:
   // filtered in groups only — in a direct chat the sender already passed allowFrom,
@@ -321,29 +290,18 @@ export async function handleVkInbound(params: {
     return;
   }
 
-  // Group access check
+  // Group access and sender authorization
   if (isGroup) {
-    if (groupConfig?.enabled === false) {
-      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (group disabled by config)`);
+    const admission = resolveVkGroupSenderAdmission(groupAccess, message.senderId);
+    if ("reason" in admission) {
+      runtime.log?.(
+        admission.reason === "chat-disabled"
+          ? `vk: drop group peerId=${redactVkId(message.peerId)} (group disabled by config)`
+          : admission.reason === "policy-disabled"
+            ? `vk: drop group peerId=${redactVkId(message.peerId)} (groupPolicy=${groupPolicy})`
+            : `vk: drop group sender ${redactVkId(message.senderId)} (groupPolicy=allowlist)`,
+      );
       return;
-    }
-    if (groupPolicy === "disabled") {
-      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (groupPolicy=${groupPolicy})`);
-      return;
-    }
-  }
-
-  // Sender authorization
-  if (isGroup) {
-    if (groupPolicy === "allowlist") {
-      const senderAllowed = resolveVkAllowlistMatch({
-        allowFrom: effectiveGroupSenderAllowFrom,
-        senderId: message.senderId,
-      });
-      if (!senderAllowed.allowed) {
-        runtime.log?.(`vk: drop group sender ${redactVkId(message.senderId)} (groupPolicy=allowlist)`);
-        return;
-      }
     }
   } else {
     if (dmPolicy === "disabled") {
@@ -430,6 +388,41 @@ export async function handleVkInbound(params: {
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
     runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (mention required)`);
+    return;
+  }
+
+  // ── A typed answer to an open question from the core ─────────────────────
+  // Taken here, before the core sees the message: while the run waits on the
+  // question the session is busy and the core only queues new messages, so
+  // its own claim of a typed answer would come after the question expired.
+  // An answer is consumed: no turn, no steering. Anything else — no open
+  // question, not an answer, refused — carries on as an ordinary message.
+  // Stop words and control commands keep their meaning: every core question
+  // takes a free-text answer, so without this «стоп» would answer it instead of
+  // aborting the run. In a group chat text is not taken at all — any admitted
+  // member could otherwise answer someone else's question; buttons still work.
+  const plainText = message.text?.trim() ?? "";
+  if (
+    plainText &&
+    !message.isGroup &&
+    !payloadCommand &&
+    !isAbortRequestText(plainText) &&
+    !core.channel.text.hasControlCommand(plainText, config as OpenClawConfig) &&
+    (message.attachments?.length ?? 0) === 0 &&
+    (message.forwards?.length ?? 0) === 0 &&
+    (await answerVkQuestionByText({
+      accountId: account.accountId,
+      peerId: message.peerId,
+      senderId: message.senderId,
+      text: plainText,
+      runtime,
+    }))
+  ) {
+    try {
+      await markMessageReadVk(String(message.peerId), message.messageId, account);
+    } catch (err) {
+      runtime.log?.(`vk: mark read failed after a question answer: ${String(err)}`);
+    }
     return;
   }
 
@@ -757,6 +750,28 @@ export async function handleVkInbound(params: {
       cmid: message.conversationMessageId,
     });
   }
+  // A question from the core in this chat — sent through `deliver` below or
+  // routed by the core as an outbound send (`ask_user` over MCP) — holds this
+  // turn and goes out as its own message. The turn goes on after the answer, so
+  // its draft must not stay above the question: later steps would be redrawn
+  // there and the final answer edited into it. The answer already in the draft
+  // is kept where it is; a bare step list is dropped, and the next step starts
+  // a fresh draft below the question.
+  const unregisterDraftHandoff = progressDraft
+    ? registerVkDraftQuestionHandoff(
+        { accountId: account.accountId, peerId: message.peerId },
+        async () => {
+          if (!progressDraft || turnSettled) {
+            return;
+          }
+          await sealDraftAnswer();
+          if (progressDraft.currentMessageId() !== undefined) {
+            await progressDraft.remove();
+            vkDiag("draft moved below question");
+          }
+        },
+      )
+    : undefined;
 
   await startTypingOnce();
 
@@ -801,6 +816,13 @@ export async function handleVkInbound(params: {
             delete outboundPayload.replyToId;
           }
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
+          // A question from the core (ask_user / AskUserQuestion) holds the
+          // turn until it is answered, so it must stay a message of its own
+          // with its buttons: never written into the step draft (the next tool
+          // step would overwrite it), never labelled as progress, never folded
+          // into the final. `sendPayloadVk` gives it the keyboard.
+          const isQuestion = readVkAskUserQuestionId(normalized) !== undefined;
+          const hasControls = Boolean(resolvedButtons) || isQuestion;
           const isFinal = info?.kind === "final";
           // ── A voice supplement is not an answer ──────────────────────────
           // The core may follow a delivered answer with a SECOND final that
@@ -837,7 +859,7 @@ export async function handleVkInbound(params: {
               !normalized.mediaUrl &&
               !(normalized.mediaUrls?.length ?? 0) &&
               markdownAttachments.attachments.length === 0 &&
-              !resolvedButtons,
+              !hasControls,
           );
           if (progressDraft && isTextBlock) {
             // Blocks are CHUNKS of the answer, not its accumulated version (the
@@ -881,6 +903,8 @@ export async function handleVkInbound(params: {
           } else if (progressDraft && !isFinal) {
             // A block with media or buttons goes as its own message. Freeze
             // the answer part in the draft first, so it stays above it.
+            // (A question also drops a bare step list: `sendPayloadVk` calls
+            // this turn's handoff, registered below, on every question path.)
             await sealDraftAnswer();
           }
 
@@ -897,7 +921,13 @@ export async function handleVkInbound(params: {
           // label written into the original would never reach the recipient.
           // A plain text block that could not go into the draft is part of the
           // answer, not progress: it carries no "working" header.
-          if (progressDraft && !isFinal && !isTextBlock && outboundPayload.text?.trim()) {
+          if (
+            progressDraft &&
+            !isFinal &&
+            !isTextBlock &&
+            !isQuestion &&
+            outboundPayload.text?.trim()
+          ) {
             const label = resolveVkProgressLabel(vkStreamingEntry);
             if (label && !outboundPayload.text.startsWith(label)) {
               outboundPayload.text = `${label} ${outboundPayload.text}`;
@@ -942,7 +972,7 @@ export async function handleVkInbound(params: {
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
             const finalText = keepsDraftAnswer ? undefined : markdownAttachments.text.trim();
-            if (draftMsgId !== undefined && finalText && !resolvedButtons && !payloadCommand) {
+            if (draftMsgId !== undefined && finalText && !hasControls && !payloadCommand) {
               const chunks = renderVkMarkdownChunks(markdownAttachments.text);
               if (chunks.length >= 1) {
                 progressDraft.compositor.markFinalReplyStarted();
@@ -1149,6 +1179,7 @@ export async function handleVkInbound(params: {
     throw err;
   } finally {
     turnSettled = true;
+    unregisterDraftHandoff?.();
     if (progressDraft) {
       try {
         progressDraft.compositor.cancel();

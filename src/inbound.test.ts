@@ -1,7 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
+
+vi.mock("openclaw/plugin-sdk/reply-runtime", () => ({
+  isAbortRequestText: (text: string) => /^\/?(stop|стоп)$/i.test(text.trim()),
+}));
 
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
@@ -306,6 +310,13 @@ vi.mock("./send.js", () => ({
 import { resolveVkAccount } from "./accounts.js";
 import { extractVkInboundAttachments } from "./media.js";
 import { handleVkInbound } from "./inbound.js";
+import { handleVkQuestionEvent } from "./question-events.js";
+import {
+  clearVkQuestionDeliveries,
+  findOpenVkQuestionDelivery,
+  rememberVkQuestionDelivery,
+  resetVkQuestionRuntimeForTest,
+} from "./question.js";
 import { setVkRuntime } from "./runtime.js";
 import {
   createVkRuntimeEnv,
@@ -3519,5 +3530,61 @@ describe("context visibility through the resolved account", () => {
     // is named only masked.
     expect(lines.join("\n")).not.toContain("142153191");
     expect(lines.join("\n")).not.toContain(String(GROUP_PEER_ID));
+  });
+});
+
+// ── A core question in a group chat ─────────────────────────────────────────
+
+describe("a core question in a group chat", () => {
+  const QID = `ask_${"7".repeat(32)}`;
+  const cfg = baseCfg({ dmPolicy: "open", groupPolicy: "open" });
+  const resolveOption = vi.fn();
+
+  beforeEach(() => {
+    resolveOption.mockReset();
+    resetVkQuestionRuntimeForTest({ runtime: { resolveOption } as never });
+    rememberVkQuestionDelivery(
+      QID,
+      { accountId: "default", peerId: GROUP_PEER_ID, messageId: 91 },
+      { questionId: QID, options: ["Белый", "Чёрный"], customInput: true },
+    );
+  });
+
+  afterEach(() => {
+    clearVkQuestionDeliveries();
+    resetVkQuestionRuntimeForTest();
+  });
+
+  it("'Свой вариант' does not ask for a typed answer, and the typed text stays an ordinary turn", async () => {
+    // The review's input: the button asked a member to type, the group text was
+    // never taken as an answer, and the question stayed open with no way on.
+    const runtime = installRuntime();
+    vi.mocked(runtime.config.current).mockReturnValue(cfg as never);
+    const answer = vi.fn().mockResolvedValue(1);
+
+    await handleVkQuestionEvent({
+      event: { userId: SENDER_ID, peerId: GROUP_PEER_ID, eventPayload: { ocq: QID, o: 1 }, answer },
+      accountId: "default",
+      runtime: createVkRuntimeEnv(),
+    });
+    const snackbar = String(answer.mock.calls[0]?.[0]?.text);
+    expect(snackbar).toBe("В беседе ответ принимается только кнопками");
+    expect(snackbar).not.toMatch(/напишите|текстом/i);
+    expect(resolveOption).not.toHaveBeenCalled();
+
+    await handleVkInbound({
+      message: makeMessage({ peerId: GROUP_PEER_ID, senderId: SENDER_ID, isGroup: true, text: "Бирюзовый" }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+    expect(resolveOption).not.toHaveBeenCalled();
+    // Still answerable by its option buttons.
+    expect(
+      findOpenVkQuestionDelivery({ questionId: QID, accountId: "default", peerId: GROUP_PEER_ID }),
+    ).toBeDefined();
   });
 });

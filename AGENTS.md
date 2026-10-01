@@ -32,6 +32,8 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 - `src/probe.ts`: token/bot probe via `groups.getById`
 - `src/media.ts`: inbound attachment extraction, outbound media loading (HTTP, data URL, local files)
 - `src/keyboard.ts`: VK keyboard/button building, text menu auto-parsing
+- `src/question.ts`: questions from the core (`ask_user`, `AskUserQuestion`) — reading them from a payload, the inline callback keyboard, where each was delivered, parsing a typed answer by the core's rules
+- `src/question-events.ts`: `message_event` (pressed question button) → the core's question resolver, with a snackbar answer; a typed answer (taken in `inbound.ts` before dispatch) → the same resolver
 - `src/types.ts`: shared plugin runtime/config/message types
 
 ## Module Format
