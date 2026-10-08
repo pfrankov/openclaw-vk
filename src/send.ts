@@ -1,8 +1,9 @@
 import { mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
+import { fetchWithSsrFGuard, SsrFBlockedError } from "openclaw/plugin-sdk/ssrf-runtime";
 import { VK, getRandomId } from "vk-io";
 import { describeMissingVkToken, resolveVkAccount } from "./accounts.js";
 import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
@@ -291,19 +292,27 @@ function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
 }
 
-async function materializeRemoteVkPhotoSource(sourceUrl: string): Promise<Buffer | null> {
-  if (!isHttpUrl(sourceUrl)) {
-    return null;
+/** Never let vk-io resolve or fetch an untrusted upload source itself. */
+async function materializeVkUploadSource(
+  source: string | Buffer,
+  title: string,
+  signal?: AbortSignal,
+  contentTypePrefix?: string,
+): Promise<{ source: string | Buffer; cleanup: () => Promise<void> }> {
+  signal?.throwIfAborted();
+  if (typeof source !== "string" || !isHttpUrl(source)) {
+    return { source, cleanup: async () => {} };
   }
-  const chunks: Buffer[] = [];
-  const read = await streamBoundedRemoteMedia(
-    sourceUrl,
-    { maxBytes: getVkRemoteMediaMaxBytes(), contentTypePrefix: "image/" },
-    (chunk) => {
-      chunks.push(chunk);
-    },
+  const local = await downloadVkRemoteMediaFile(
+    source,
+    title,
+    signal,
+    contentTypePrefix,
   );
-  return read.ok ? Buffer.concat(chunks, read.bytes) : null;
+  if (local.kind === "rejected") {
+    throw new VkMediaRejectedError(local.reason);
+  }
+  return { source: local.path, cleanup: local.cleanup };
 }
 
 function isRetryableVkError(error: unknown): boolean {
@@ -1042,10 +1051,8 @@ export async function sendPhotoVk(
     contentType?: string;
     /**
      * Whether to retry "photo is undefined" instead of failing immediately. The
-     * caller decides, because only it knows whether it has a fallback: a picture
-     * behind a URL does (download and retry with the bytes), a local file does
-     * not, and there the retry is the only thing between a photo and a grey
-     * document card.
+     * caller decides whether a failed photo should get another upload attempt
+     * before it falls back to a document. Every attempt uses the same bytes.
      */
     retryTransientPhotoErrors?: boolean;
   },
@@ -1056,6 +1063,8 @@ export async function sendPhotoVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  const local = await materializeVkUploadSource(photoSource, uploadMeta?.filename ?? "photo", opts.abortSignal, "image/");
+  photoSource = local.source;
   const attachment = await runMediaUpload({
     kind: "photo",
     source: photoSource,
@@ -1076,7 +1085,7 @@ export async function sendPhotoVk(
           contentType: uploadMeta?.contentType,
         }),
       }),
-  });
+  }).finally(local.cleanup);
   return await sendVkAttachmentWithCaption({
     to: normalizedTo,
     peerId,
@@ -1101,6 +1110,8 @@ export async function sendDocumentVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  const local = await materializeVkUploadSource(docSource, title, opts.abortSignal);
+  docSource = local.source;
   const attachment = await runMediaUpload({
     kind: "document",
     source: docSource,
@@ -1118,7 +1129,7 @@ export async function sendDocumentVk(
         }),
         title,
       }),
-  });
+  }).finally(local.cleanup);
   return await sendVkAttachmentWithCaption({
     to: normalizedTo,
     peerId,
@@ -1130,7 +1141,7 @@ export async function sendDocumentVk(
 }
 
 /** Why a remote download was refused; logged as a token, never with the URL. */
-type VkRemoteMediaRejection = "unavailable" | "content-type" | "too-large" | "empty" | "timeout";
+type VkRemoteMediaRejection = "unavailable" | "unsafe-url" | "content-type" | "too-large" | "empty" | "timeout";
 
 type VkRemoteMediaRead = { ok: true; bytes: number } | { ok: false; reason: VkRemoteMediaRejection };
 
@@ -1141,11 +1152,9 @@ function readRejection(read: VkRemoteMediaRead): VkRemoteMediaRejection | null {
 /**
  * Streams a remote media body with a byte ceiling, handing chunks to `sink`.
  *
- * One reader for both media paths. They used to be two: audio counted bytes and
- * enforced a ceiling, photos read `arrayBuffer()` with no limit at all — the
- * same untrusted URL from a model reply, one of them unbounded. Streaming also
- * lets the audio path write straight to disk instead of holding the whole file
- * in memory and then writing it, which peaked at twice the file size.
+ * The SDK checks every destination and redirect and pins DNS for the connection.
+ * Media streams straight to disk so queued uploads do not hold entire files
+ * in memory while waiting for another transfer to finish.
  *
  * A refusal says why, because the caller must tell a policy refusal apart from
  * "not a remote source": the former ends the media path, and the URL is never
@@ -1162,8 +1171,10 @@ async function streamBoundedRemoteMedia(
   opts.signal?.throwIfAborted();
   const timeout = AbortSignal.timeout(VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  let guarded: Awaited<ReturnType<typeof fetchWithSsrFGuard>> | undefined;
   try {
-    const response = await fetch(url, { signal });
+    guarded = await fetchWithSsrFGuard({ url, signal, mode: "strict", pinDns: true });
+    const { response } = guarded;
     if (!response.ok || !response.body) {
       return { ok: false, reason: "unavailable" };
     }
@@ -1192,7 +1203,12 @@ async function streamBoundedRemoteMedia(
     if (opts.signal?.aborted) {
       throw error;
     }
-    return { ok: false, reason: timeout.aborted ? "timeout" : "unavailable" };
+    return {
+      ok: false,
+      reason: error instanceof SsrFBlockedError ? "unsafe-url" : timeout.aborted ? "timeout" : "unavailable",
+    };
+  } finally {
+    await guarded?.release();
   }
 }
 
@@ -1206,10 +1222,58 @@ async function streamBoundedRemoteMedia(
  * - `rejected`: a remote download refused by policy. This one ends the media
  *   path: handing the URL to vk-io would fetch the very bytes just refused.
  */
-type VkLocalAudioFile =
+type VkDownloadedMediaFile =
   | { kind: "local"; path: string; cleanup: () => Promise<void> }
-  | { kind: "unsupported" }
   | { kind: "rejected"; reason: VkRemoteMediaRejection };
+
+type VkLocalAudioFile = VkDownloadedMediaFile | { kind: "unsupported" };
+
+/** A bounded local copy, shared by every remote upload path. */
+async function downloadVkRemoteMediaFile(
+  url: string,
+  title: string,
+  signal?: AbortSignal,
+  contentTypePrefix?: string,
+): Promise<VkDownloadedMediaFile> {
+  signal?.throwIfAborted();
+  let dir: string;
+  try {
+    dir = await mkdtemp(join(tmpdir(), "vk-media-src-"));
+  } catch {
+    return { kind: "rejected", reason: "unavailable" };
+  }
+  // Keep the display title in upload metadata, not in the local path. A short
+  // portable extension preserves the container ffmpeg uses for audio splits.
+  const extension = extname(title);
+  const safeExtension = /^\.[a-z0-9]{1,10}$/i.test(extension) ? extension : "";
+  const path = join(dir, `source${safeExtension}`);
+  const cleanup = async () => {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  };
+  const handle = await open(path, "w").catch(() => null);
+  if (!handle) {
+    await cleanup();
+    return { kind: "rejected", reason: "unavailable" };
+  }
+  const read = await streamBoundedRemoteMedia(
+    url,
+    { maxBytes: getVkRemoteMediaMaxBytes(), signal, contentTypePrefix },
+    async (chunk) => {
+      await handle.writeFile(chunk);
+    },
+  ).catch(async (error: unknown) => {
+    await handle.close().catch(() => {});
+    await cleanup();
+    throw error;
+  });
+  await handle.close().catch(() => {});
+  const rejection = readRejection(read);
+  if (rejection) {
+    await cleanup();
+    return { kind: "rejected", reason: rejection };
+  }
+  return { kind: "local", path, cleanup };
+}
 
 async function materializeLocalAudioFile(
   audioSource: string | Buffer,
@@ -1243,47 +1307,10 @@ async function materializeLocalAudioFile(
     }
   }
 
-  // Materialize remote audio into a temporary file: otherwise a long recording
-  // behind a URL was never split and went as one piece, which VK rejected.
-  //
-  // Streamed straight to disk rather than buffered and then written: at the
-  // 128 MB ceiling the old path peaked at twice that in memory, on a machine
-  // that also holds local models.
+  // The same guarded, bounded download used for photos and documents also
+  // gives ffmpeg a local file to measure and split.
   if (isHttpUrl(audioSource)) {
-    let dir: string;
-    try {
-      dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
-    } catch {
-      return { kind: "rejected", reason: "unavailable" };
-    }
-    const path = join(dir, title.replace(/[\\/]/g, "_") || "voice.ogg");
-    const cleanup = async () => {
-      await rm(dir, { recursive: true, force: true }).catch(() => {});
-    };
-    const handle = await open(path, "w").catch(() => null);
-    if (!handle) {
-      await cleanup();
-      return { kind: "rejected", reason: "unavailable" };
-    }
-    const read: VkRemoteMediaRead = await streamBoundedRemoteMedia(
-      audioSource,
-      { maxBytes: getVkRemoteMediaMaxBytes(), signal },
-      async (chunk) => {
-        await handle.write(chunk);
-      },
-    ).catch(async (error: unknown) => {
-      // Only a cancellation escapes the reader; the file it was writing goes too.
-      await handle.close().catch(() => {});
-      await cleanup();
-      throw error;
-    });
-    await handle.close().catch(() => {});
-    const rejection = readRejection(read);
-    if (rejection) {
-      await cleanup();
-      return { kind: "rejected", reason: rejection };
-    }
-    return { kind: "local", path, cleanup };
+    return await downloadVkRemoteMediaFile(audioSource, title, signal);
   }
 
   // data: and file:// are left alone: the first is already in memory and arrives
@@ -1987,6 +2014,7 @@ async function sendResolvedMediaVk(params: {
     forceDocument: params.opts.forceDocument,
     preferredName: params.media.title,
     preferredMimeType: params.media.mimeType,
+    abortSignal: params.opts.abortSignal,
   });
   const sourceUrl = isHttpUrl(media.mediaUrl) ? media.mediaUrl : undefined;
 
@@ -2004,48 +2032,43 @@ async function sendResolvedMediaVk(params: {
   };
 
   if (media.kind === "image") {
-    let photoSource: string | Buffer = media.source;
-    let photoError: unknown;
+    let local: Awaited<ReturnType<typeof materializeVkUploadSource>>;
     try {
-      return await sendPhotoVk(params.to, photoSource, params.caption, params.opts, {
-        filename: media.title,
-        contentType: media.mimeType,
-        retryTransientPhotoErrors: !sourceUrl,
-      });
+      local = await materializeVkUploadSource(media.source, media.title, params.opts.abortSignal, "image/");
     } catch (error) {
-      photoError = error;
-    }
-
-    if (sourceUrl && typeof photoSource === "string" && isVkPhotoSourceRejectedError(photoError)) {
-      const materialized = await materializeRemoteVkPhotoSource(sourceUrl);
-      if (!materialized) {
-        return await sendSourceUrlFallback();
-      }
-      photoSource = materialized;
-      try {
-        return await sendPhotoVk(params.to, photoSource, params.caption, params.opts, {
-          filename: media.title,
-          contentType: media.mimeType,
-        });
-      } catch (retryPhotoError) {
-        photoError = retryPhotoError;
-      }
-    }
-
-    const shouldFallbackToDocument = isVkImageUploadFallbackError(photoError);
-    if (!shouldFallbackToDocument) {
-      throw photoError;
-    }
-
-    try {
-      return await sendDocumentVk(params.to, photoSource, media.title, params.caption, params.opts, {
-        contentType: media.mimeType,
-      });
-    } catch (documentError) {
-      if (!isVkImageUploadFallbackError(documentError)) {
-        throw documentError;
+      if (isDeliveryStop(error, params.opts.abortSignal) || !(error instanceof VkMediaRejectedError)) {
+        throw error;
       }
       return await sendSourceUrlFallback();
+    }
+    // Keep one local copy alive across retries and the document fallback.
+    try {
+      let photoError: unknown;
+      try {
+        return await sendPhotoVk(params.to, local.source, params.caption, params.opts, {
+          filename: media.title,
+          contentType: media.mimeType,
+          retryTransientPhotoErrors: true,
+        });
+      } catch (error) {
+        photoError = error;
+      }
+
+      if (!isVkImageUploadFallbackError(photoError)) {
+        throw photoError;
+      }
+      try {
+        return await sendDocumentVk(params.to, local.source, media.title, params.caption, params.opts, {
+          contentType: media.mimeType,
+        });
+      } catch (documentError) {
+        if (!isVkImageUploadFallbackError(documentError)) {
+          throw documentError;
+        }
+        return await sendSourceUrlFallback();
+      }
+    } finally {
+      await local.cleanup();
     }
   }
   if (media.kind === "audio_message") {

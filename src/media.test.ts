@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
+import { SsrFBlockedError } from "openclaw/plugin-sdk/ssrf-runtime";
 import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
@@ -40,10 +41,31 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
 }));
 
 const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
+const mockRelease = vi.fn();
+const mockRawFetch = vi.fn();
+const mockFetchWithSsrFGuard = vi.hoisted(() => vi.fn());
+
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  fetchWithSsrFGuard: mockFetchWithSsrFGuard,
+  SsrFBlockedError: class SsrFBlockedError extends Error {},
+}));
+
+vi.stubGlobal("fetch", mockRawFetch as unknown as typeof fetch);
 
 beforeEach(() => {
   mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
+  mockRawFetch.mockReset().mockRejectedValue(new Error("unguarded metadata fetch"));
+  mockRelease.mockReset().mockImplementation(async (response: Response) => {
+    await response.body?.cancel?.();
+  });
+  mockFetchWithSsrFGuard.mockReset().mockImplementation(async ({ url, init, signal }) => {
+    const response = await mockFetch(url, { ...init, signal });
+    return { response, finalUrl: url, release: () => mockRelease(response) };
+  });
+});
+
+afterEach(() => {
+  expect(mockRawFetch).not.toHaveBeenCalled();
 });
 
 // ── extractVkInboundAttachments ─────────────────────────────────────────────
@@ -812,7 +834,154 @@ describe("loadVkOutboundMedia", () => {
       "https://example.com/download/42",
       expect.objectContaining({ method: "HEAD" }),
     );
+    expect(mockFetchWithSsrFGuard).toHaveBeenCalledExactlyOnceWith({
+      url: "https://example.com/download/42",
+      init: { method: "HEAD" },
+      mode: "strict",
+      pinDns: true,
+      signal: expect.any(AbortSignal),
+    });
+    expect(mockRelease).toHaveBeenCalledTimes(1);
     expect(cancel).toHaveBeenCalled();
+  });
+
+  it("releases HEAD before a guarded range GET and releases the GET afterwards", async () => {
+    const head = new Response(null, { status: 405 });
+    const get = new Response("ignored body", {
+      headers: {
+        "content-type": "application/pdf",
+        "content-disposition": 'attachment; filename="report.pdf"',
+      },
+    });
+    let headReleased = false;
+    mockRelease.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      headReleased = true;
+    });
+    mockFetch.mockResolvedValueOnce(head).mockImplementationOnce(async () => {
+      expect(headReleased).toBe(true);
+      return get;
+    });
+
+    const result = await loadVkOutboundMedia({ mediaUrl: "https://example.com/download/42" });
+
+    expect(result).toMatchObject({ kind: "document", title: "report.pdf", mimeType: "application/pdf" });
+    expect(mockFetchWithSsrFGuard).toHaveBeenNthCalledWith(2, {
+      url: "https://example.com/download/42",
+      init: { method: "GET", headers: { Range: "bytes=0-0" } },
+      mode: "strict",
+      pinDns: true,
+      signal: mockFetchWithSsrFGuard.mock.calls[0]?.[0].signal,
+    });
+    expect(mockRelease.mock.calls.map(([response]) => response)).toEqual([head, get]);
+    expect(get.bodyUsed).toBe(true);
+  });
+
+  it("ends metadata resolution when the guard blocks HEAD", async () => {
+    const blocked = new SsrFBlockedError("blocked destination");
+    mockFetchWithSsrFGuard.mockRejectedValueOnce(blocked);
+
+    await expect(
+      loadVkOutboundMedia({ mediaUrl: "http://127.0.0.1/private" }),
+    ).rejects.toBe(blocked);
+
+    expect(mockFetchWithSsrFGuard).toHaveBeenCalledTimes(1);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockRelease).not.toHaveBeenCalled();
+  });
+
+  it("does not retain an upload URL when the guard blocks the metadata GET", async () => {
+    const head = new Response(null, { headers: { "content-type": "image/png" } });
+    const blocked = new SsrFBlockedError("blocked redirect destination");
+    mockFetch.mockResolvedValueOnce(head).mockRejectedValueOnce(blocked);
+
+    await expect(
+      loadVkOutboundMedia({ mediaUrl: "https://example.com/render/42" }),
+    ).rejects.toBe(blocked);
+
+    expect(mockFetchWithSsrFGuard).toHaveBeenCalledTimes(2);
+    expect(mockRelease).toHaveBeenCalledExactlyOnceWith(head);
+  });
+
+  it("keeps metadata best-effort when HEAD fails for an ordinary transport error", async () => {
+    const get = new Response(null, {
+      headers: {
+        "content-type": "application/pdf",
+        "content-disposition": 'attachment; filename="report.pdf"',
+      },
+    });
+    mockFetch.mockRejectedValueOnce(new Error("connection reset")).mockResolvedValueOnce(get);
+
+    const result = await loadVkOutboundMedia({ mediaUrl: "https://example.com/download/42" });
+
+    expect(result).toMatchObject({ kind: "document", title: "report.pdf", mimeType: "application/pdf" });
+    expect(mockFetchWithSsrFGuard).toHaveBeenCalledTimes(2);
+    expect(mockRelease).toHaveBeenCalledExactlyOnceWith(get);
+  });
+
+  it("shares one five-second deadline across HEAD and GET and keeps the available metadata", async () => {
+    vi.useFakeTimers();
+    try {
+      const head = new Response(null, { headers: { "content-type": "image/png" } });
+      mockFetch.mockImplementationOnce(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 4_000));
+        return head;
+      }).mockImplementationOnce((_url, opts) => new Promise((_resolve, reject) => {
+        opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true });
+      }));
+
+      const loading = loadVkOutboundMedia({ mediaUrl: "https://example.com/render/42" });
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(mockFetchWithSsrFGuard).toHaveBeenCalledTimes(2);
+      const signal = mockFetchWithSsrFGuard.mock.calls[0]?.[0].signal;
+      expect(mockFetchWithSsrFGuard.mock.calls[1]?.[0].signal).toBe(signal);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(loading).resolves.toMatchObject({ kind: "image", title: "42.png", mimeType: "image/png" });
+      expect(signal.aborted).toBe(true);
+      expect(mockRelease).toHaveBeenCalledExactlyOnceWith(head);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honours an already-aborted caller without starting metadata requests", async () => {
+    const caller = new AbortController();
+    caller.abort();
+
+    await expect(loadVkOutboundMedia({
+      mediaUrl: "https://example.com/render/42",
+      abortSignal: caller.signal,
+    })).rejects.toBe(caller.signal.reason);
+
+    expect(mockFetchWithSsrFGuard).not.toHaveBeenCalled();
+  });
+
+  it.each(["HEAD", "GET"])("propagates caller cancellation during %s without another request", async (method) => {
+    const caller = new AbortController();
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+    const head = new Response(null, { headers: { "content-type": "image/png" } });
+    mockFetch.mockImplementation((_url, opts) => {
+      if (opts.method !== method) {
+        return Promise.resolve(head);
+      }
+      requestStarted();
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true });
+      });
+    });
+
+    const loading = loadVkOutboundMedia({
+      mediaUrl: "https://example.com/render/42",
+      abortSignal: caller.signal,
+    });
+    await started;
+    caller.abort();
+
+    await expect(loading).rejects.toBe(caller.signal.reason);
+    expect(mockFetchWithSsrFGuard).toHaveBeenCalledTimes(method === "HEAD" ? 1 : 2);
+    expect(mockRelease).toHaveBeenCalledTimes(method === "HEAD" ? 0 : 1);
   });
 
   it("uses remote content-type to classify extensionless HTTP images", async () => {

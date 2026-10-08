@@ -1,9 +1,10 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { VK } from "vk-io";
+import { SsrFBlockedError } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
   applyVkAllowlistConfigEdit,
   clearVkInstances,
@@ -122,6 +123,13 @@ const mockGroupsGetById = vi.hoisted(() =>
 );
 const mockGetRandomId = vi.hoisted(() => vi.fn().mockReturnValue(99999));
 const mockFetch = vi.hoisted(() => vi.fn());
+const mockGuardedFetch = vi.hoisted(() => vi.fn());
+const mockReleaseRemoteMedia = vi.hoisted(() => vi.fn());
+
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  fetchWithSsrFGuard: mockGuardedFetch,
+  SsrFBlockedError: class SsrFBlockedError extends Error {},
+}));
 
 vi.mock("vk-io", () => ({
   // Must use a regular function (not an arrow) so `new VK(...)` works.
@@ -155,6 +163,9 @@ vi.mock("vk-io", () => ({
   getRandomId: mockGetRandomId,
 }));
 vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
+
+// A fresh stream for every public photo/document download.
+const REMOTE_MEDIA_BYTES = Buffer.from("downloaded-media");
 
 /**
  * A remote audio body for the bounded reader. Remote audio is always downloaded
@@ -239,7 +250,16 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
   mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
-  mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
+  mockFetch.mockReset().mockImplementation(async () =>
+    new Response(REMOTE_MEDIA_BYTES, { headers: { "content-type": "image/png" } }),
+  );
+  mockReleaseRemoteMedia.mockReset().mockImplementation(async (response: Response) => {
+    await response.body?.cancel?.();
+  });
+  mockGuardedFetch.mockReset().mockImplementation(async ({ url, init, signal }) => {
+    const response = await mockFetch(url, { ...init, signal });
+    return { response, finalUrl: url, release: () => mockReleaseRemoteMedia(response) };
+  });
   mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
   mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
   mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
@@ -420,7 +440,7 @@ describe("sendMessageVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/reply-back.jpg",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "reply-back.jpg",
         contentType: "image/jpeg",
       },
@@ -497,7 +517,7 @@ describe("sendFormattedTextVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/reply-back.jpg",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "reply-back.jpg",
         contentType: "image/jpeg",
       },
@@ -558,7 +578,7 @@ describe("sendPhotoVk", () => {
 
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/img.png" },
+      source: { value: expect.stringContaining(join(tmpdir(), "vk-media-src-")) },
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1025,7 +1045,7 @@ describe("sendAudioMessageVk", () => {
         uploadUrl: "https://upload.vk.example/audio",
         values: [
           {
-            value: expect.stringContaining("vk-voice-src-"),
+            value: expect.stringContaining("vk-media-src-"),
             filename: "voice.mp3",
           },
         ],
@@ -1833,7 +1853,7 @@ describe("sendFormattedMediaVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/img.png",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "img.png",
         contentType: "image/png",
       },
@@ -2229,7 +2249,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/photo.png",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "photo.png",
         contentType: "image/png",
       },
@@ -2243,14 +2263,8 @@ describe("sendPayloadVk", () => {
   });
 
   it("refuses a remote photo that exceeds the media ceiling", async () => {
-    // The photo path used to read `arrayBuffer()` with no limit at all, on the
-    // same untrusted model-supplied URL the audio path already capped.
+    // The limit applies before the first VK upload, including its fallback.
     process.env.VK_REMOTE_AUDIO_MAX_BYTES = "4";
-    const invalidPhotoError = Object.assign(
-      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
-      { code: 100 },
-    );
-    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
     mockFetch.mockResolvedValueOnce({
       ok: true,
       headers: { get: () => "image/png" },
@@ -2266,15 +2280,17 @@ describe("sendPayloadVk", () => {
         { text: "caption", mediaUrl: "https://example.com/big.png" },
         { cfg },
       );
-      // The oversized body is dropped, so no second upload attempt is made
-      // from it; delivery falls through to the document path instead.
-      expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+      expect(mockUploadPhoto).not.toHaveBeenCalled();
+      expect(mockUploadDocument).not.toHaveBeenCalled();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockReleaseRemoteMedia).toHaveBeenCalledTimes(1);
+      expect(getSendCall().message).toBe("caption\nhttps://example.com/big.png");
     } finally {
       delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
     }
   });
 
-  it("retries image upload with downloaded buffer when VK rejects URL source", async () => {
+  it("retries image upload with the same guarded bytes without downloading again", async () => {
     const invalidPhotoError = Object.assign(
       new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
       { code: 100 },
@@ -2304,21 +2320,17 @@ describe("sendPayloadVk", () => {
 
     expect(result).toEqual({ messageId: "34", chatId: "123" });
     expect(mockFetch).toHaveBeenCalledWith("https://example.com/photo.png", expect.any(Object));
+    expect(mockGuardedFetch).toHaveBeenCalledTimes(1);
     expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
     expect(mockUploadPhoto.mock.calls[0]?.[0]).toEqual({
       peer_id: 123,
       source: {
-        value: "https://example.com/photo.png",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "photo.png",
         contentType: "image/png",
       },
     });
-    expect(mockUploadPhoto.mock.calls[1]?.[0]).toEqual(
-      expect.objectContaining({
-        peer_id: 123,
-        source: expect.objectContaining({ value: expect.any(Buffer) }),
-      }),
-    );
+    expect(mockUploadPhoto.mock.calls[1]?.[0]).toEqual(mockUploadPhoto.mock.calls[0]?.[0]);
     expect(mockMessagesSend).toHaveBeenLastCalledWith(
       expect.objectContaining({
         message: "caption",
@@ -2327,12 +2339,12 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("falls through to document upload when both URL photo attempts are rejected", async () => {
+  it("reuses the guarded photo bytes as a document after photo retries are exhausted", async () => {
     const invalidPhotoError = Object.assign(
       new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
       { code: 100 },
     );
-    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError).mockRejectedValueOnce(invalidPhotoError);
+    mockUploadPhoto.mockRejectedValue(invalidPhotoError);
     mockUploadDocument.mockResolvedValueOnce("doc321_654");
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -2357,11 +2369,12 @@ describe("sendPayloadVk", () => {
     );
 
     expect(result).toEqual({ messageId: "38", chatId: "123" });
-    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(3);
+    expect(mockGuardedFetch).toHaveBeenCalledTimes(1);
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: expect.any(Buffer),
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "photo.png",
         contentType: "image/png",
       },
@@ -2369,12 +2382,7 @@ describe("sendPayloadVk", () => {
     });
   });
 
-  it("falls back to URL text when VK rejects URL photo and remote download fails", async () => {
-    const invalidPhotoError = Object.assign(
-      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
-      { code: 100 },
-    );
-    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+  it("falls back to URL text without uploading when the guarded photo download fails", async () => {
     mockFetch.mockRejectedValueOnce(new Error("download failed"));
     mockMessagesSend.mockResolvedValueOnce(35);
 
@@ -2388,7 +2396,7 @@ describe("sendPayloadVk", () => {
     );
 
     expect(result).toEqual({ messageId: "35", chatId: "123" });
-    expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
     expect(mockUploadDocument).not.toHaveBeenCalled();
     expect(mockMessagesSend).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -2415,11 +2423,6 @@ describe("sendPayloadVk", () => {
   });
 
   it("falls back to URL text when fetched URL is not an image content-type", async () => {
-    const invalidPhotoError = Object.assign(
-      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
-      { code: 100 },
-    );
-    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
     mockFetch.mockResolvedValueOnce({
       ok: true,
       headers: {
@@ -2443,7 +2446,9 @@ describe("sendPayloadVk", () => {
     );
 
     expect(result).toEqual({ messageId: "36", chatId: "123" });
-    expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockReleaseRemoteMedia).toHaveBeenCalledTimes(1);
     expect(mockMessagesSend).toHaveBeenLastCalledWith(
       expect.objectContaining({
         message: "caption\nhttps://example.com/photo.png",
@@ -2474,7 +2479,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/photo.png",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "photo.png",
         contentType: "image/png",
       },
@@ -2482,7 +2487,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/photo.png",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "photo.png",
         contentType: "image/png",
       },
@@ -2518,7 +2523,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith(
       expect.objectContaining({
         source: {
-          value: "https://example.com/photo.png",
+          value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
           filename: "photo.png",
           contentType: "image/png",
         },
@@ -2527,7 +2532,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadDocument).toHaveBeenCalledWith(
       expect.objectContaining({
         source: {
-          value: "https://example.com/photo.png",
+          value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
           filename: "photo.png",
           contentType: "image/png",
         },
@@ -2621,7 +2626,7 @@ describe("sendPayloadVk", () => {
         uploadUrl: "https://upload.vk.example/audio",
         values: [
           {
-            value: expect.stringContaining("vk-voice-src-"),
+            value: expect.stringContaining("vk-media-src-"),
             filename: "voice.mp3",
             contentType: "audio/mpeg",
           },
@@ -2905,7 +2910,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/report.pdf",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "report.pdf",
         contentType: "application/pdf",
       },
@@ -2947,7 +2952,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/download?id=42",
+        value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
         filename: "report.pdf",
         contentType: "application/pdf",
       },
@@ -3039,7 +3044,7 @@ describe("sendPayloadVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledWith(
       expect.objectContaining({
         source: {
-          value: "https://example.com/used.png",
+          value: expect.stringContaining(join(tmpdir(), "vk-media-src-")),
           filename: "used.png",
           contentType: "image/png",
         },
@@ -3703,5 +3708,149 @@ describe("retry logic", () => {
     expect(mockMessagesSend).toHaveBeenCalledTimes(2);
     expect(aborts(added)).toBe(1);
     expect(aborts(removed)).toBe(1);
+  });
+});
+
+describe("remote upload policy", () => {
+  const senders = [
+    {
+      name: "photo", extension: ".png", upload: mockUploadPhoto,
+      send: (url: string, title = "photo.png") => sendPhotoVk("123", url, undefined, { cfg }, { filename: title }),
+    },
+    {
+      name: "document", extension: ".pdf", upload: mockUploadDocument,
+      send: (url: string, title = "file.pdf") => sendDocumentVk("123", url, title, undefined, { cfg }),
+    },
+    {
+      name: "audio", extension: ".mp3", upload: mockUploadAudioMessage,
+      send: (url: string, title = "voice.mp3") => sendAudioMessageVk("123", url, title, undefined, { cfg }),
+    },
+  ];
+
+  it.each(senders)("keeps a long $name title out of its portable temporary path", async ({ send, upload, extension }) => {
+    const title = `report:question?star*${"a".repeat(300)}${extension}`;
+    let path = "";
+    upload.mockImplementationOnce(async ({ source }) => {
+      const file = source.values?.[0] ?? source;
+      path = file.value;
+      expect(file.filename).toBe(title);
+      expect(Buffer.byteLength(basename(path))).toBeLessThanOrEqual(255);
+      expect(basename(path)).not.toMatch(/[<>:"/\\|?*\u0000-\u001f]/);
+      // Audio splitting selects its output container from this extension.
+      expect(extname(path)).toBe(extension);
+      expect(await readFile(path)).toEqual(REMOTE_MEDIA_BYTES);
+      return "attachment123_456";
+    });
+    mockMessagesSend.mockResolvedValueOnce(42);
+
+    await expect(send("https://example.com/media", title)).resolves.toEqual({ messageId: "42", chatId: "123" });
+    expect(mockGuardedFetch).toHaveBeenCalledOnce();
+    expect(upload).toHaveBeenCalledOnce();
+    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    { name: "overlong extension", title: `report.${"x".repeat(300)}` },
+    { name: "Windows-forbidden extension", title: "report.p?d*f" },
+  ])("uploads a document with an $name without using that extension on disk", async ({ title }) => {
+    let path = "";
+    mockUploadDocument.mockImplementationOnce(async ({ source, title: uploadTitle }) => {
+      path = source.value;
+      expect(source.filename).toBe(title);
+      expect(uploadTitle).toBe(title);
+      expect(Buffer.byteLength(basename(path))).toBeLessThanOrEqual(255);
+      expect(basename(path)).not.toMatch(/[<>:"/\\|?*\u0000-\u001f]/);
+      expect(await readFile(path)).toEqual(REMOTE_MEDIA_BYTES);
+      return "doc123_789";
+    });
+    mockMessagesSend.mockResolvedValueOnce(42);
+
+    await expect(sendDocumentVk("123", "https://example.com/file", title, undefined, { cfg }))
+      .resolves.toEqual({ messageId: "42", chatId: "123" });
+    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(senders)("ends $name delivery when the SDK blocks its destination", async ({ send }) => {
+    mockGuardedFetch.mockRejectedValueOnce(new SsrFBlockedError("private address"));
+
+    await expect(send("https://files.example.com/media")).rejects.toMatchObject({
+      name: "VkMediaRejectedError",
+      reason: "unsafe-url",
+    });
+    expect(mockGuardedFetch).toHaveBeenCalledWith(expect.objectContaining({
+      url: "https://files.example.com/media",
+      mode: "strict",
+      pinDns: true,
+    }));
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reason: "unavailable", response: () => new Response("error", { status: 503 }) },
+    { reason: "unavailable", response: () => new Response(null) },
+    { reason: "empty", response: () => new Response(new Uint8Array()) },
+    { reason: "too-large", response: () => new Response("small", { headers: { "content-length": "129" } }) },
+    { reason: "too-large", response: () => new Response(Buffer.alloc(129)) },
+  ])("releases a document response rejected as $reason before uploading", async ({ reason, response }) => {
+    vi.stubEnv("VK_REMOTE_AUDIO_MAX_BYTES", "128");
+    const rejectedResponse = response();
+    mockFetch.mockResolvedValueOnce(rejectedResponse);
+    try {
+      await expect(sendDocumentVk("123", "https://example.com/file.pdf", "file.pdf", undefined, { cfg }))
+        .rejects.toMatchObject({ name: "VkMediaRejectedError", reason });
+      expect(mockGuardedFetch).toHaveBeenCalledOnce();
+      expect(mockReleaseRemoteMedia).toHaveBeenCalledWith(rejectedResponse);
+      expect(mockUploadDocument).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("uploads the complete guarded document from disk and removes its copy afterwards", async () => {
+    let path = "";
+    mockUploadDocument.mockImplementationOnce(async ({ source }) => {
+      path = source.value;
+      expect(typeof path).toBe("string");
+      expect(path).not.toMatch(/^https?:\/\//i);
+      expect(await readFile(path)).toEqual(REMOTE_MEDIA_BYTES);
+      return "doc123_789";
+    });
+    mockMessagesSend.mockResolvedValueOnce(42);
+
+    await expect(sendDocumentVk("123", "https://example.com/file.pdf", "file.pdf", undefined, { cfg }))
+      .resolves.toEqual({ messageId: "42", chatId: "123" });
+    expect(mockGuardedFetch).toHaveBeenCalledOnce();
+    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not bypass the guard when an image is forced to a document", async () => {
+    mockGuardedFetch.mockRejectedValueOnce(new SsrFBlockedError("private address"));
+
+    await expect(sendPayloadVk("123", { mediaUrl: "https://example.com/file.png" }, { cfg, forceDocument: true }))
+      .rejects.toMatchObject({ name: "VkMediaRejectedError", reason: "unsafe-url" });
+    expect(mockGuardedFetch).toHaveBeenCalledOnce();
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+  });
+
+  it("propagates a stop during photo download without uploading or sending a text fallback", async () => {
+    const controller = new AbortController();
+    mockGuardedFetch.mockImplementationOnce(async () => {
+      controller.abort();
+      throw controller.signal.reason;
+    });
+
+    await expect(sendPayloadVk("123", { mediaUrl: "https://example.com/file.png" }, {
+      cfg,
+      abortSignal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
   });
 });

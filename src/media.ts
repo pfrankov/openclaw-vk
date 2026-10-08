@@ -3,6 +3,7 @@ import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node
 import { fileURLToPath } from "node:url";
 import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
 import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
+import { fetchWithSsrFGuard, SsrFBlockedError } from "openclaw/plugin-sdk/ssrf-runtime";
 import { describeVkDownloadFailure } from "./diagnostics.js";
 import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
@@ -935,56 +936,55 @@ function decodeDataUrl(dataUrl: string): { buffer: Buffer; mimeType?: string; na
 
 async function readRemoteMediaMetadata(
   mediaUrl: string,
+  abortSignal?: AbortSignal,
 ): Promise<{ title?: string; mimeType?: string }> {
-  if (typeof fetch !== "function") {
-    return {};
-  }
-
+  abortSignal?.throwIfAborted();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), OUTBOUND_REMOTE_METADATA_TIMEOUT_MS);
-  let headResponse: Response | undefined;
-  let getResponse: Response | undefined;
+  const signal = abortSignal ? AbortSignal.any([abortSignal, controller.signal]) : controller.signal;
+
+  const readHeaders = async (method: "HEAD" | "GET"): Promise<{ title?: string; mimeType?: string }> => {
+    try {
+      const { response, release } = await fetchWithSsrFGuard({
+        url: mediaUrl,
+        init: { method, ...(method === "GET" ? { headers: { Range: "bytes=0-0" } } : {}) },
+        mode: "strict",
+        pinDns: true,
+        signal,
+      });
+      try {
+        abortSignal?.throwIfAborted();
+        return response.ok
+          ? {
+              mimeType: response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || undefined,
+              title: extractFilenameFromContentDisposition(response.headers.get("content-disposition") ?? undefined),
+            }
+          : {};
+      } finally {
+        // Metadata never consumes the body, even when the server ignores Range.
+        await release();
+      }
+    } catch (error) {
+      abortSignal?.throwIfAborted();
+      if (error instanceof SsrFBlockedError) {
+        // A blocked destination must not turn into another request or an upload.
+        throw error;
+      }
+      return {};
+    }
+  };
 
   try {
-    try {
-      headResponse = await fetch(mediaUrl, {
-        method: "HEAD",
-        signal: controller.signal,
-      });
-    } catch {
-      headResponse = undefined;
+    const metadata = await readHeaders("HEAD");
+    if ((!metadata.mimeType || !metadata.title) && !signal.aborted) {
+      const fallback = await readHeaders("GET");
+      metadata.mimeType ||= fallback.mimeType;
+      metadata.title ||= fallback.title;
     }
-
-    let mimeType =
-      headResponse?.ok === true
-        ? headResponse.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || undefined
-        : undefined;
-    let title =
-      headResponse?.ok === true
-        ? extractFilenameFromContentDisposition(headResponse.headers.get("content-disposition") ?? undefined)
-        : undefined;
-
-    if (!mimeType || !title) {
-      try {
-        getResponse = await fetch(mediaUrl, {
-          method: "GET",
-          signal: controller.signal,
-        });
-      } catch {
-        getResponse = undefined;
-      }
-
-      if (getResponse?.ok) {
-        mimeType ||= getResponse.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || undefined;
-        title ||= extractFilenameFromContentDisposition(getResponse.headers.get("content-disposition") ?? undefined);
-      }
-    }
-
-    return { title, mimeType };
+    abortSignal?.throwIfAborted();
+    return metadata;
   } finally {
     clearTimeout(timeout);
-    void headResponse?.body?.cancel?.();
-    void getResponse?.body?.cancel?.();
   }
 }
 
@@ -1057,11 +1057,13 @@ async function resolveAllowedLocalPath(
 
 export async function loadVkOutboundMedia(params: {
   mediaUrl: string;
+  abortSignal?: AbortSignal;
   mediaLocalRoots?: readonly string[];
   forceDocument?: boolean;
   preferredName?: string;
   preferredMimeType?: string;
 }): Promise<VkResolvedOutboundMedia> {
+  params.abortSignal?.throwIfAborted();
   const mediaUrl = params.mediaUrl.trim();
   if (!mediaUrl) {
     throw new Error("Missing media URL");
@@ -1096,7 +1098,7 @@ export async function loadVkOutboundMedia(params: {
     mimeType ??= mimeFromExtension(extname(title));
 
     if (!preferredName && (!mimeType || !hasUsefulOutboundExtension(title))) {
-      const remoteMetadata = await readRemoteMediaMetadata(mediaUrl);
+      const remoteMetadata = await readRemoteMediaMetadata(mediaUrl, params.abortSignal);
       mimeType ||= remoteMetadata.mimeType;
       title = normalizeOutboundTitle(remoteMetadata.title ?? inferredTitle, mimeType);
       mimeType ??= mimeFromExtension(extname(title));
