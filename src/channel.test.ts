@@ -914,6 +914,41 @@ describe("outbound", () => {
     expect(result.channel).toBe("vk");
   });
 
+  it.each(["sendText", "sendFormattedText", "sendMedia"] as const)(
+    "%s preserves caller media roots when text contains a local attachment",
+    async (method) => {
+      const cfg = { channels: { vk: { token: "test-token" } } };
+      const text = "Отчёт: [report](./report.pdf)";
+      const send = method === "sendFormattedText" ? mockSendFormattedTextVk : mockSendMessageVk;
+      for (const mediaLocalRoots of [["/trusted/agent-workspace"], []]) {
+        const result = await vkPlugin.outbound![method]!({
+          cfg,
+          to: "123",
+          text,
+          accountId: "sales",
+          replyToId: "77",
+          mediaLocalRoots,
+        } as never);
+
+        expect(send).toHaveBeenLastCalledWith("123", text, {
+          cfg,
+          accountId: "sales",
+          replyTo: "77",
+          mediaLocalRoots,
+        });
+        expect(send.mock.calls.at(-1)?.[2]?.mediaLocalRoots).toBe(mediaLocalRoots);
+        expect(result).toEqual(
+          method === "sendFormattedText"
+            ? [
+                { channel: "vk", messageId: "f-1", chatId: "0" },
+                { channel: "vk", messageId: "f-2", chatId: "0" },
+              ]
+            : { channel: "vk", messageId: "1", chatId: "0" },
+        );
+      }
+    },
+  );
+
   it("logs one line per core-routed send, which the inbound deliver log never sees", async () => {
     mockVkDiag.mockClear();
 

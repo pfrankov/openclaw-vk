@@ -1,5 +1,5 @@
 import { readFile, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
+import { basename, extname, isAbsolute, parse as parsePath, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
 import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
@@ -1009,12 +1009,17 @@ async function resolveAllowedLocalPath(
     )
   ).filter((entry): entry is string => Boolean(entry));
 
-  const hasRootRestrictions = Boolean(mediaLocalRoots?.length);
+  if (resolvedRoots.some((root) => root === parsePath(root).root)) {
+    throw new Error("Local media roots must not include a filesystem root; use a narrower directory");
+  }
+  if (resolvedRoots.length === 0) {
+    throw new Error(`Local media path is outside allowed roots: ${input}`);
+  }
   const isWithinAllowedRoot = (resolvedPath: string) =>
     resolvedRoots.some((root) => resolvedPath === root || resolvedPath.startsWith(`${root}${sep}`));
 
   // Relative MEDIA paths should resolve from an allowed root/workspace, not the gateway cwd.
-  if (!isAbsolute(normalizedInput) && hasRootRestrictions) {
+  if (!isAbsolute(normalizedInput)) {
     for (const root of resolvedRoots) {
       const candidatePath = resolvePath(root, normalizedInput);
       try {
@@ -1027,10 +1032,6 @@ async function resolveAllowedLocalPath(
       }
     }
 
-    if (resolvedRoots.length === 0) {
-      throw new Error(`Local media path is outside allowed roots: ${input}`);
-    }
-
     const attemptedPath = resolvePath(resolvedRoots[0], normalizedInput);
     const resolvedAttemptedPath = await realpath(attemptedPath);
     if (!isWithinAllowedRoot(resolvedAttemptedPath)) {
@@ -1039,14 +1040,7 @@ async function resolveAllowedLocalPath(
     return resolvedAttemptedPath;
   }
 
-  const absolutePath = isAbsolute(normalizedInput)
-    ? normalizedInput
-    : resolvePath(normalizedInput);
-  const resolvedPath = await realpath(absolutePath);
-
-  if (!hasRootRestrictions) {
-    return resolvedPath;
-  }
+  const resolvedPath = await realpath(normalizedInput);
 
   if (!isWithinAllowedRoot(resolvedPath)) {
     throw new Error(`Local media path is outside allowed roots: ${input}`);
@@ -1057,6 +1051,7 @@ async function resolveAllowedLocalPath(
 
 export async function loadVkOutboundMedia(params: {
   mediaUrl: string;
+  /** Local files require explicit, usable roots; HTTP and data URLs do not. */
   mediaLocalRoots?: readonly string[];
   forceDocument?: boolean;
   preferredName?: string;

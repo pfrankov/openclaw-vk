@@ -1,6 +1,7 @@
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth-native";
 import { getReplyPayloadTtsSupplement } from "openclaw/plugin-sdk/reply-payload";
 import { isAbortRequestText } from "openclaw/plugin-sdk/reply-runtime";
+import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-local-roots";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { StreamingCompatEntry } from "./sdk-compat.js";
 import {
@@ -165,11 +166,15 @@ async function deliverVkReply(params: {
   payload: VkDispatchPayload;
   peerId: number;
   accountId: string;
+  config: CoreConfig;
+  mediaLocalRoots: readonly string[];
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
   clearKeyboard?: boolean;
 }) {
   const result = await sendPayloadVk(String(params.peerId), params.payload, {
+    cfg: params.config,
     accountId: params.accountId,
+    mediaLocalRoots: params.mediaLocalRoots,
     clearKeyboard: params.clearKeyboard,
   });
   if (!result) {
@@ -324,6 +329,8 @@ export async function handleVkInbound(params: {
                 payload: { text },
                 peerId: message.senderId,
                 accountId: account.accountId,
+                config,
+                mediaLocalRoots: [],
                 statusSink,
               });
             },
@@ -437,6 +444,9 @@ export async function handleVkInbound(params: {
       id: peerId,
     },
   });
+  // Reply paths are untrusted: source-derived expansion would let a file reference
+  // authorize its own parent directory under permissive read-tool policies.
+  const mediaLocalRoots = getAgentScopedMediaLocalRoots(config as OpenClawConfig, route.agentId);
 
   const fromLabel = isGroup ? `vk:chat:${message.peerId}` : `vk:${message.senderId}`;
   const storePath = core.channel.session.resolveStorePath(
@@ -1010,7 +1020,9 @@ export async function handleVkInbound(params: {
                     // cannot hold more than ~4096 characters in one bubble.
                     for (const chunk of chunks.slice(1)) {
                       await sendMessageVk(String(message.peerId), chunk.text, {
+                        cfg: config,
                         accountId: account.accountId,
+                        mediaLocalRoots,
                       });
                     }
                     // Attachments from markdown links go the ordinary way, as
@@ -1021,6 +1033,8 @@ export async function handleVkInbound(params: {
                         payload: { text: markdownAttachments.attachments.join("\n") },
                         peerId: message.peerId,
                         accountId: account.accountId,
+                        config,
+                        mediaLocalRoots,
                         statusSink,
                       });
                     }
@@ -1038,6 +1052,8 @@ export async function handleVkInbound(params: {
                           payload: { ...normalized, text: "", mediaUrl: media, mediaUrls: undefined },
                           peerId: message.peerId,
                           accountId: account.accountId,
+                          config,
+                          mediaLocalRoots,
                           statusSink,
                         });
                       }
@@ -1072,6 +1088,8 @@ export async function handleVkInbound(params: {
               payload: outboundPayload,
               peerId: message.peerId,
               accountId: account.accountId,
+              config,
+              mediaLocalRoots,
               statusSink,
               clearKeyboard:
                 payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,

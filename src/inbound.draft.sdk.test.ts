@@ -1,6 +1,9 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { VkInboundMessage } from "./types.js";
+import type { CoreConfig, VkInboundMessage } from "./types.js";
 
 /**
  * The step draft through the REAL core: `channel-outbound` (compositor, stream
@@ -50,6 +53,14 @@ const chat = vi.hoisted(() => ({
   failSendMessageFrom: null as number | null,
   failSendPayload: false,
   payloadCalls: [] as Array<Record<string, unknown>>,
+  /** Exercise the real local-file loader and uploader, replacing only VK's network. */
+  realMedia: false,
+  documentUploads: [] as Array<{
+    peerId: number;
+    value: string | Buffer;
+    filename?: string;
+    contentType?: string;
+  }>,
 }));
 
 // Only the calls that reach VK are replaced; the rest of send.js — the markdown
@@ -87,7 +98,7 @@ vi.mock("./send.js", async (importOriginal) => {
     // A question takes the REAL send path — the one that moves the draft out
     // of its way — down to VK's API, which is the fake chat below.
     const channelData = payload.channelData as { askUser?: unknown } | undefined;
-    if (channelData?.askUser) {
+    if (channelData?.askUser || chat.realMedia) {
       return await actual.sendPayloadVk(to, payload as never, opts);
     }
     if (chat.failSendPayload) {
@@ -119,18 +130,38 @@ vi.mock("./send.js", async (importOriginal) => {
   };
 });
 
-// VK's API, for the one real send path above (questions): into the same chat.
+// VK's network, for the real question and media send paths: into the same chat.
 vi.mock("vk-io", () => ({
   VK: vi.fn().mockImplementation(function () {
     return {
       api: {
         messages: {
-          send: vi.fn(async (params: { message: string }) => {
+          send: vi.fn(async (params: {
+            message: string;
+            attachment?: string;
+            format_data?: string;
+            reply_to?: number;
+          }) => {
             const id = chat.nextId++;
-            chat.messages.push({ id, text: params.message, media: [] });
+            chat.messages.push({
+              id,
+              text: params.message,
+              media: params.attachment ? [params.attachment] : [],
+              formatData: params.format_data ? JSON.parse(params.format_data) : undefined,
+              replyTo: params.reply_to === undefined ? undefined : String(params.reply_to),
+            });
             return id;
           }),
         },
+      },
+      upload: {
+        messageDocument: vi.fn(async (params: {
+          peer_id: number;
+          source: { value: string | Buffer; filename?: string; contentType?: string };
+        }) => {
+          chat.documentUploads.push({ peerId: params.peer_id, ...params.source });
+          return "doc123_456";
+        }),
       },
     };
   }),
@@ -189,9 +220,9 @@ function progressCfg() {
 async function runTurn(
   scenario: Scenario,
   message: Partial<VkInboundMessage> = {},
+  cfg: CoreConfig = progressCfg(),
 ): Promise<void> {
   run.scenario = scenario;
-  const cfg = progressCfg();
   await inbound!.handleVkInbound({
     message: helpers!.makeMessage({ conversationMessageId: 42, text: "сделай", ...message }),
     account: helpers!.makeAccount({
@@ -220,6 +251,8 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     chat.failSendMessageFrom = null;
     chat.failSendPayload = false;
     chat.payloadCalls = [];
+    chat.realMedia = false;
+    chat.documentUploads = [];
     run.scenario = null;
     const runtime = helpers!.makeVkRuntime();
     // The agent run: each test scripts what the core delivers.
@@ -369,6 +402,125 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
   });
 
   // ── P1-3: markdown attachments of an answer written into the draft ───────
+
+  describe("local attachments through the real loader and SDK roots", () => {
+    let fixtureDir: string;
+    let otherFile: string;
+    let cfg: CoreConfig;
+    const report = Buffer.from("%PDF-1.7\nresearch report");
+
+    beforeEach(async () => {
+      fixtureDir = await mkdtemp(join(tmpdir(), "vk-reply-media-"));
+      const workspace = join(fixtureDir, "workspace-research");
+      const otherWorkspace = join(fixtureDir, "workspace-other");
+      await mkdir(workspace);
+      await mkdir(otherWorkspace);
+      await writeFile(join(workspace, "report.pdf"), report);
+      otherFile = join(otherWorkspace, "report.pdf");
+      await writeFile(otherFile, "private file from another agent");
+      cfg = {
+        ...progressCfg(),
+        agents: {
+          list: [
+            { id: "other", default: true, workspace: otherWorkspace },
+            { id: "research", workspace },
+          ],
+        },
+      };
+      vi.mocked(runtimeModule!.getVkRuntime().channel.routing.resolveAgentRoute).mockReturnValue({
+        agentId: "research",
+        accountId: "default",
+        sessionKey: "agent:research:vk:123456",
+      } as never);
+      chat.realMedia = true;
+    });
+
+    afterEach(async () => {
+      await rm(fixtureDir, { recursive: true, force: true });
+    });
+
+    const paths = [
+      ["markdown", false],
+      ["explicit media", false],
+      ["markdown", true],
+      ["explicit media", true],
+    ] as const;
+
+    it.each(paths)("uploads only the routed agent's file via %s (draft: %s)", async (kind, draft) => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        if (draft) await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver(
+          kind === "markdown"
+            ? { text: "Отчёт готов. [report](./report.pdf)" }
+            : { text: "Отчёт готов.", mediaUrl: "./report.pdf" },
+          { kind: "final" },
+        );
+      }, {}, cfg);
+
+      expect(chat.documentUploads).toEqual([{
+        peerId: 123456,
+        value: report,
+        filename: "report.pdf",
+        contentType: "application/pdf",
+      }]);
+      expect(chat.messages.flatMap((message) => message.media)).toEqual(["doc123_456"]);
+      expect(texts().filter((text) => text.includes("Отчёт готов."))).toHaveLength(1);
+      expect(texts().join("\n")).not.toContain("report.pdf");
+    });
+
+    it.each(paths)("rejects another agent's file via %s (draft: %s)", async (kind, draft) => {
+      let rejected: unknown;
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        if (draft) await replyOptions.onToolStart?.(toolStart());
+        try {
+          await dispatcherOptions.deliver(
+            kind === "markdown"
+              ? { text: `Отчёт готов. [report](${otherFile})` }
+              : { text: "Отчёт готов.", mediaUrl: otherFile },
+            { kind: "final" },
+          );
+        } catch (error) {
+          rejected = error;
+        }
+      }, {}, cfg);
+
+      expect(rejected).toBeInstanceOf(Error);
+      expect(String(rejected)).toMatch(/mediaLocalRoots|allowed roots/);
+      expect(chat.documentUploads).toEqual([]);
+      expect(chat.messages.flatMap((message) => message.media)).toEqual([]);
+      // An edited draft may already contain the caption; no fallback exposes the path.
+      expect(texts().join("\n")).not.toContain(otherFile);
+      if (!draft) expect(chat.messages).toEqual([]);
+    });
+
+    it("rejects an outside reply file even when tools allow unrestricted filesystem access", async () => {
+      await runTurn(async ({ dispatcherOptions }) => {
+        await expect(dispatcherOptions.deliver(
+          { text: `Отчёт готов. [report](${otherFile})` },
+          { kind: "final" },
+        )).rejects.toThrow(/mediaLocalRoots|allowed roots/);
+      }, {}, {
+        ...cfg,
+        tools: { profile: "full", fs: { workspaceOnly: false } },
+      });
+
+      expect(chat.documentUploads).toEqual([]);
+      expect(chat.messages).toEqual([]);
+    });
+
+    it("keeps an ordinary formatted reply intact without uploading a file", async () => {
+      await runTurn(async ({ dispatcherOptions }) => {
+        await dispatcherOptions.deliver({ text: "Обычный **ответ**." }, { kind: "final" });
+      }, {}, cfg);
+
+      expect(texts()).toEqual(["Обычный ответ."]);
+      expect(chat.documentUploads).toEqual([]);
+      expect(chat.messages[0]?.media).toEqual([]);
+      expect(chat.messages[0]?.formatData).toMatchObject({
+        items: [expect.objectContaining({ type: "bold", offset: 8, length: 5 })],
+      });
+    });
+  });
 
   describe("markdown attachments in an answer written into the draft", () => {
     it("sends a markdown image as an attachment, not as a link in the draft", async () => {
