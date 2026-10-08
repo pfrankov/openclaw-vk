@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (for transitive accounts.ts and runtime.ts imports) ────────────
 
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  fetchWithSsrFGuard: vi.fn().mockRejectedValue(new Error("Unexpected outbound media request")),
+  SsrFBlockedError: class SsrFBlockedError extends Error {},
+}));
+
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text,
