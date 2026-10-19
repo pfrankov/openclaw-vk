@@ -16,6 +16,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...actual, realpath: vi.fn(actual.realpath), readFile: vi.fn(actual.readFile) };
 });
 
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  fetchWithSsrFGuard: vi.fn().mockRejectedValue(new Error("Unexpected outbound media request")),
+  SsrFBlockedError: class SsrFBlockedError extends Error {},
+}));
+
 vi.mock("openclaw/plugin-sdk/core", async () => ({
   formatZonedTimestamp: (await import("./test-helpers.js")).formatZonedTimestampLikeCore,
 }));

@@ -12,6 +12,11 @@ vi.mock("openclaw/plugin-sdk/media-local-roots", () => ({
   getAgentScopedMediaLocalRoots: mockGetAgentScopedMediaLocalRoots,
 }));
 
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
+  fetchWithSsrFGuard: vi.fn().mockRejectedValue(new Error("Unexpected outbound media request")),
+  SsrFBlockedError: class SsrFBlockedError extends Error {},
+}));
+
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text,
