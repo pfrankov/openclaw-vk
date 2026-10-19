@@ -7,6 +7,11 @@ vi.mock("openclaw/plugin-sdk/reply-runtime", () => ({
   isAbortRequestText: (text: string) => /^\/?(stop|стоп)$/i.test(text.trim()),
 }));
 
+const mockGetAgentScopedMediaLocalRoots = vi.hoisted(() => vi.fn(() => ["/trusted/default-workspace"]));
+vi.mock("openclaw/plugin-sdk/media-local-roots", () => ({
+  getAgentScopedMediaLocalRoots: mockGetAgentScopedMediaLocalRoots,
+}));
+
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text,
@@ -359,6 +364,7 @@ function getDispatchCall(runtime: ReturnType<typeof makeVkRuntime>) {
 }
 
 beforeEach(() => {
+  mockGetAgentScopedMediaLocalRoots.mockReset().mockReturnValue(["/trusted/default-workspace"]);
   mockMarkMessageReadVk.mockReset().mockResolvedValue(undefined);
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
@@ -573,8 +579,9 @@ describe("DM access control", () => {
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       { text: "pairing-reply-text" },
-      { accountId: "default" },
+      { accountId: "default", cfg: baseCfg(), mediaLocalRoots: [] },
     );
+    expect(mockGetAgentScopedMediaLocalRoots).not.toHaveBeenCalled();
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
     expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
     expect(mockSendTypingVk).not.toHaveBeenCalled();
@@ -608,7 +615,7 @@ describe("DM access control", () => {
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       { text: "pairing-reply-text" },
-      { accountId },
+      { accountId, cfg: baseCfg(), mediaLocalRoots: [] },
     );
   });
 
@@ -1114,8 +1121,55 @@ describe("dispatch payload", () => {
           },
         },
       },
-      { accountId: "default" },
+      { accountId: "default", cfg: baseCfg(), mediaLocalRoots: ["/trusted/default-workspace"] },
     );
+  });
+
+  it("scopes reply attachments to the routed agent using the inbound config", async () => {
+    const mediaLocalRoots = ["/trusted/research-workspace"];
+    mockGetAgentScopedMediaLocalRoots.mockReturnValue(mediaLocalRoots);
+    const config = {
+      ...baseCfg(),
+      agents: {
+        list: [
+          { id: "research", workspace: mediaLocalRoots[0] },
+          { id: "other", workspace: "/trusted/other-workspace" },
+        ],
+      },
+    } as CoreConfig;
+    const runtime = installRuntime({
+      resolveAgentRoute: vi.fn().mockReturnValue({
+        agentId: "research",
+        accountId: "sales",
+        sessionKey: "agent:research:vk:123456",
+      }),
+    });
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({
+          text: "Отчёт готов.",
+          mediaUrl: "./report.pdf",
+          // A reply payload cannot grant filesystem access.
+          mediaLocalRoots: ["/"],
+        }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage(),
+      account: makeAccount({ accountId: "sales", config: { dmPolicy: "open" } }),
+      config,
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockGetAgentScopedMediaLocalRoots).toHaveBeenCalledExactlyOnceWith(config, "research");
+    expect(mockSendPayloadVk).toHaveBeenCalledExactlyOnceWith(
+      "123456",
+      expect.objectContaining({ text: "Отчёт готов.", mediaUrl: "./report.pdf" }),
+      expect.objectContaining({ cfg: config, accountId: "sales", mediaLocalRoots }),
+    );
+    expect(mockSendPayloadVk.mock.calls[0]?.[2]?.mediaLocalRoots).toBe(mediaLocalRoots);
+    expect(mockSendPayloadVk.mock.calls[0]?.[2]?.cfg).toBe(config);
   });
 
   it("quotes the inbound message in group replies", async () => {
@@ -1141,7 +1195,7 @@ describe("dispatch payload", () => {
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(GROUP_PEER_ID),
       { text: "Group reply", replyToId: "group-77" },
-      { accountId: "default" },
+      { accountId: "default", cfg: baseCfg(), mediaLocalRoots: ["/trusted/default-workspace"] },
     );
   });
 
@@ -1176,7 +1230,12 @@ describe("dispatch payload", () => {
         text: "Thinking level set to high.",
         replyToId: "msg-1",
       },
-      { accountId: "default", clearKeyboard: true },
+      {
+        accountId: "default",
+        cfg: baseCfg(),
+        mediaLocalRoots: ["/trusted/default-workspace"],
+        clearKeyboard: true,
+      },
     );
   });
 
@@ -1217,7 +1276,7 @@ describe("dispatch payload", () => {
         ].join("\n"),
         replyToId: "msg-1",
       },
-      { accountId: "default" },
+      { accountId: "default", cfg: baseCfg(), mediaLocalRoots: ["/trusted/default-workspace"] },
     );
   });
 
@@ -1794,7 +1853,12 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     expect(mockSendPayloadVk).toHaveBeenCalledExactlyOnceWith(
       String(SENDER_ID),
       { text: "первая часть\n\nвторая часть", replyToId: "button-7" },
-      { accountId: "default", clearKeyboard: true },
+      {
+        accountId: "default",
+        cfg: baseCfg({ streaming: { mode: "progress" } }),
+        mediaLocalRoots: ["/trusted/default-workspace"],
+        clearKeyboard: true,
+      },
     );
     expect(mockDraftRemove).toHaveBeenCalled();
     expect(mockSendPayloadVk.mock.invocationCallOrder[0]).toBeLessThan(
@@ -2525,6 +2589,8 @@ describe("status reaction lifecycle", () => {
     expect(controller.setError).not.toHaveBeenCalled();
     expect(mockSendPayloadVk).toHaveBeenCalledWith(String(SENDER_ID), {}, {
       accountId: "default",
+      cfg: statusReactionConfig(),
+      mediaLocalRoots: ["/trusted/default-workspace"],
     });
     expect(statusSink).toHaveBeenCalledWith({ lastOutboundAt: expect.any(Number) });
   });
@@ -2649,7 +2715,7 @@ describe("status reaction lifecycle", () => {
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       { text: "pairing-reply-text" },
-      { accountId: "default" },
+      { accountId: "default", cfg: baseCfg(), mediaLocalRoots: [] },
     );
     expect(statusSink).toHaveBeenCalledTimes(1);
     expect(statusSink).toHaveBeenCalledWith({ lastInboundAt: 1_700_000_000_000 });

@@ -1,6 +1,7 @@
-import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse as parsePath, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { MessageContext, WallAttachment } from "vk-io";
 import {
@@ -942,23 +943,27 @@ describe("loadVkOutboundMedia", () => {
     it("reads local image file", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "test.png"),
+        mediaLocalRoots: [tempDir],
       });
       expect(result.kind).toBe("image");
-      expect(result.source).toBeInstanceOf(Buffer);
+      expect(result.source).toEqual(Buffer.from("fake-png"));
       expect(result.title).toBe("test.png");
     });
 
     it("reads local document file", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "doc.pdf"),
+        mediaLocalRoots: [tempDir],
       });
       expect(result.kind).toBe("document");
+      expect(result.source).toEqual(Buffer.from("fake-pdf"));
       expect(result.title).toBe("doc.pdf");
     });
 
     it("uses preferred file name to classify and title extensionless local files", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "artifact"),
+        mediaLocalRoots: [tempDir],
         preferredName: "test-small.txt",
       });
       expect(result.kind).toBe("document");
@@ -968,8 +973,10 @@ describe("loadVkOutboundMedia", () => {
     it("reads local audio file as audio_message", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "voice.mp3"),
+        mediaLocalRoots: [tempDir],
       });
       expect(result.kind).toBe("audio_message");
+      expect(result.source).toEqual(Buffer.from("fake-mp3"));
       expect(result.title).toBe("voice.mp3");
     });
 
@@ -985,9 +992,35 @@ describe("loadVkOutboundMedia", () => {
     it("allows local path within allowed roots", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "test.png"),
-        mediaLocalRoots: [tempDir],
+        mediaLocalRoots: [`${tempDir}${sep}`],
       });
       expect(result.kind).toBe("image");
+      expect(result.source).toEqual(Buffer.from("fake-png"));
+    });
+
+    it.each(["alone", "with a narrow root"])("rejects a filesystem root %s", async (kind) => {
+      const filesystemRoot = parsePath(tempDir).root;
+      await expect(
+        loadVkOutboundMedia({
+          mediaUrl: join(tempDir, "test.png"),
+          mediaLocalRoots: kind === "alone" ? [filesystemRoot] : [filesystemRoot, tempDir],
+        }),
+      ).rejects.toThrow("Local media roots must not include a filesystem root");
+    });
+
+    it("rejects an allowed-root symlink that resolves to the filesystem root", async () => {
+      const linkPath = join(tempDir, "filesystem-root");
+      try {
+        await symlink(parsePath(tempDir).root, linkPath, "dir");
+        await expect(
+          loadVkOutboundMedia({
+            mediaUrl: join(tempDir, "test.png"),
+            mediaLocalRoots: [linkPath],
+          }),
+        ).rejects.toThrow("Local media roots must not include a filesystem root");
+      } finally {
+        await rm(linkPath, { force: true });
+      }
     });
 
     it("resolves relative local paths against allowed roots before cwd", async () => {
@@ -1007,16 +1040,26 @@ describe("loadVkOutboundMedia", () => {
       }
     });
 
-    it("resolves relative local paths against cwd when roots are omitted", async () => {
-      const cwd = process.cwd();
-      try {
-        process.chdir(tempDir);
-        const result = await loadVkOutboundMedia({ mediaUrl: "test.png" });
-        expect(result.kind).toBe("image");
-        expect(result.title).toBe("test.png");
-      } finally {
-        process.chdir(cwd);
-      }
+    describe.each([
+      { label: "omitted", roots: undefined },
+      { label: "empty", roots: [] },
+      { label: "blank", roots: ["", "   "] },
+    ])("with $label roots", ({ roots }) => {
+      it.each(["absolute", "file URL", "relative"])("rejects an existing %s file", async (kind) => {
+        const cwd = process.cwd();
+        try {
+          process.chdir(tempDir);
+          const filePath = join(tempDir, "test.png");
+          const mediaUrl = kind === "absolute"
+            ? filePath
+            : kind === "file URL" ? pathToFileURL(filePath).href : "test.png";
+          await expect(
+            loadVkOutboundMedia({ mediaUrl, mediaLocalRoots: roots }),
+          ).rejects.toThrow("outside allowed roots");
+        } finally {
+          process.chdir(cwd);
+        }
+      });
     });
 
     it("ignores blank and non-resolvable roots when an allowed root exists", async () => {
@@ -1055,10 +1098,44 @@ describe("loadVkOutboundMedia", () => {
       ).rejects.toThrow("outside allowed roots");
     });
 
+    it("rejects a sibling directory sharing the allowed root's prefix", async () => {
+      const outsideDir = await mkdtemp(`${tempDir}-outside-`);
+      try {
+        const filePath = join(outsideDir, "secret.txt");
+        await writeFile(filePath, "private fixture");
+        await expect(
+          loadVkOutboundMedia({ mediaUrl: filePath, mediaLocalRoots: [tempDir] }),
+        ).rejects.toThrow("outside allowed roots");
+      } finally {
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects absolute, file URL and relative symlinks that escape an allowed root", async () => {
+      const outsideDir = await mkdtemp(join(tmpdir(), "vk-media-symlink-"));
+      const linkPath = join(tempDir, "escape.txt");
+      try {
+        const filePath = join(outsideDir, "secret.txt");
+        await writeFile(filePath, "private fixture");
+        await symlink(filePath, linkPath);
+        for (const mediaUrl of [linkPath, pathToFileURL(linkPath).href, "escape.txt"]) {
+          await expect(
+            loadVkOutboundMedia({ mediaUrl, mediaLocalRoots: [tempDir] }),
+          ).rejects.toThrow("outside allowed roots");
+        }
+      } finally {
+        await rm(linkPath, { force: true });
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+
     it("throws for non-existent file", async () => {
       await expect(
-        loadVkOutboundMedia({ mediaUrl: join(tempDir, "missing.png") }),
-      ).rejects.toThrow();
+        loadVkOutboundMedia({
+          mediaUrl: join(tempDir, "missing.png"),
+          mediaLocalRoots: [tempDir],
+        }),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     });
   });
 });

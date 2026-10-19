@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,6 +31,7 @@ import {
   editMessageVk,
   sendTypingVk,
   splitVkMarkdownAttachments,
+  type SendVkOptions,
 } from "./send.js";
 import { makeAccount } from "./test-helpers.js";
 
@@ -538,6 +539,50 @@ describe("sendFormattedTextVk", () => {
         attachment: "doc123_789",
       }),
     );
+  });
+});
+
+describe.each([
+  {
+    name: "plain text",
+    send: (url: string, opts: SendVkOptions) => sendMessageVk("123", `[voice.mp3](${url})`, opts),
+  },
+  {
+    name: "formatted text",
+    send: (url: string, opts: SendVkOptions) => sendFormattedTextVk("123", `[voice.mp3](${url})`, opts),
+  },
+  {
+    name: "payload Markdown",
+    send: (url: string, opts: SendVkOptions) => sendPayloadVk("123", { text: `[voice.mp3](${url})` }, opts),
+  },
+  {
+    name: "payload media",
+    send: (url: string, opts: SendVkOptions) => sendPayloadVk("123", { mediaUrl: url }, opts),
+  },
+  {
+    name: "formatted media",
+    send: (url: string, opts: SendVkOptions) => sendFormattedMediaVk("123", "Voice", url, opts),
+  },
+])("$name local media policy", ({ send }) => {
+  it.each(["omitted", "empty", "outside"])("rejects %s roots before upload or fallback", async (policy) => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-local-policy-"));
+    try {
+      const filePath = join(tempDir, "voice.mp3");
+      await writeFile(filePath, "private fixture");
+      const allowedDir = join(tempDir, "allowed");
+      await mkdir(allowedDir);
+      const mediaLocalRoots = policy === "omitted" ? undefined : policy === "empty" ? [] : [allowedDir];
+      await expect(
+        send(pathToFileURL(filePath).href, { cfg, mediaLocalRoots }),
+      ).rejects.toThrow("outside allowed roots");
+      expect(mockUploadPhoto).not.toHaveBeenCalled();
+      expect(mockUploadDocument).not.toHaveBeenCalled();
+      expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });
 

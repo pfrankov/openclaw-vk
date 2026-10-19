@@ -362,10 +362,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         ? { channel: "vk", ...result }
         : { channel: "vk", messageId: "", chatId: to };
     },
-    sendFormattedText: async ({ cfg, to, text, accountId, replyToId }) => {
+    sendFormattedText: async ({ cfg, to, text, mediaLocalRoots, accountId, replyToId }) => {
       const results = await sendFormattedTextVk(to, text, {
         cfg,
         accountId: accountId ?? undefined,
+        mediaLocalRoots,
         replyTo: replyToId ?? undefined,
       });
       logVkOutbound("sendFormattedText", to, {
@@ -387,10 +388,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       logVkOutbound("sendFormattedMedia", to, { textLen: text.length, media: true, messageId: result.messageId });
       return { channel: "vk", ...result };
     },
-    sendText: async ({ cfg, to, text, accountId, replyToId }) => {
+    sendText: async ({ cfg, to, text, mediaLocalRoots, accountId, replyToId }) => {
       const result = await sendMessageVk(to, text, {
         cfg,
         accountId: accountId ?? undefined,
+        mediaLocalRoots,
         replyTo: replyToId ?? undefined,
       });
       logVkOutbound("sendText", to, { textLen: text.length, media: false, messageId: result.messageId });
@@ -405,6 +407,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         const textOnly = await sendMessageVk(to, text, {
           cfg,
           accountId: accountId ?? undefined,
+          mediaLocalRoots,
           replyTo: replyToId ?? undefined,
         });
         logVkOutbound("sendMedia", to, { textLen: text?.length ?? 0, media: false, messageId: textOnly.messageId });

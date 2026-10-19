@@ -1,5 +1,13 @@
 import { readFile, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
+import {
+  basename,
+  extname,
+  isAbsolute,
+  parse as parsePath,
+  relative as relativePath,
+  resolve as resolvePath,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
 import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
@@ -988,20 +996,68 @@ async function readRemoteMediaMetadata(
   }
 }
 
+/**
+ * A path that names another machine or a device rather than a local file: UNC
+ * shares (`\\host\share`, `//host/share`), and the `\\?\` and `\\.\`
+ * namespaces. On Windows any filesystem call on such a path (even `realpath`)
+ * opens an SMB connection and can hand the host's credentials to that machine,
+ * so it is refused before the filesystem is touched, on every platform.
+ * Mirrors the SDK's `assertNoWindowsNetworkPath`, but stricter: the SDK still
+ * admits `\\?\C:\`, which no media reply needs.
+ */
+function isNetworkStyleLocalPath(value: string): boolean {
+  return /^[\\/]{2}/.test(value);
+}
+
+/** A `file:` URL as a local path, refusing remote hosts and encoded separators. */
+function localPathFromFileUrl(input: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`Local media path is not a valid file URL: ${input}`);
+  }
+  // WHATWG URL parsing already maps `file://localhost/...` to an empty host.
+  if (parsed.hostname && parsed.hostname.toLowerCase() !== "localhost") {
+    throw new Error(`Local media path must not use a network location: ${input}`);
+  }
+  if (/%(?:2f|5c)/i.test(parsed.pathname)) {
+    throw new Error(`Local media file URL must not encode path separators: ${input}`);
+  }
+  return fileURLToPath(parsed);
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const rel = relativePath(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
 async function resolveAllowedLocalPath(
   input: string,
   mediaLocalRoots?: readonly string[],
 ): Promise<string> {
-  const normalizedInput = input.startsWith("file://") ? fileURLToPath(input) : input;
+  const outside = () => new Error(`Local media path is outside allowed roots: ${input}`);
+  // Everything about the reply-supplied path that can be decided without the
+  // filesystem is decided first: no fs call is made for a refused input.
+  if (isNetworkStyleLocalPath(input)) {
+    throw new Error(`Local media path must not use a network location: ${input}`);
+  }
+  const normalizedInput = /^file:/i.test(input) ? localPathFromFileUrl(input) : input;
+  if (isNetworkStyleLocalPath(normalizedInput)) {
+    throw new Error(`Local media path must not use a network location: ${input}`);
+  }
+
+  const configuredRoots = (mediaLocalRoots ?? [])
+    .map((root) => root?.trim())
+    .filter((root): root is string => Boolean(root) && !isNetworkStyleLocalPath(root as string));
+  if (configuredRoots.length === 0) {
+    throw outside();
+  }
   const resolvedRoots = (
     await Promise.all(
-      (mediaLocalRoots ?? []).map(async (root) => {
-        const trimmed = root?.trim();
-        if (!trimmed) {
-          return null;
-        }
+      configuredRoots.map(async (root) => {
         try {
-          return await realpath(trimmed);
+          return await realpath(root);
         } catch {
           return null;
         }
@@ -1009,16 +1065,28 @@ async function resolveAllowedLocalPath(
     )
   ).filter((entry): entry is string => Boolean(entry));
 
-  const hasRootRestrictions = Boolean(mediaLocalRoots?.length);
+  if (resolvedRoots.some((root) => root === parsePath(root).root)) {
+    throw new Error("Local media roots must not include a filesystem root; use a narrower directory");
+  }
+  if (resolvedRoots.length === 0) {
+    throw outside();
+  }
   const isWithinAllowedRoot = (resolvedPath: string) =>
-    resolvedRoots.some((root) => resolvedPath === root || resolvedPath.startsWith(`${root}${sep}`));
+    resolvedRoots.some((root) => isPathWithin(root, resolvedPath));
 
   // Relative MEDIA paths should resolve from an allowed root/workspace, not the gateway cwd.
-  if (!isAbsolute(normalizedInput) && hasRootRestrictions) {
-    for (const root of resolvedRoots) {
-      const candidatePath = resolvePath(root, normalizedInput);
+  if (!isAbsolute(normalizedInput)) {
+    // Lexical pre-check: `../` that climbs out of a root is refused without
+    // probing the filesystem for what lies outside it.
+    const candidates = resolvedRoots
+      .map((root) => ({ root, path: resolvePath(root, normalizedInput) }))
+      .filter(({ root, path }) => isPathWithin(root, path));
+    if (candidates.length === 0) {
+      throw outside();
+    }
+    for (const { path } of candidates) {
       try {
-        const resolvedCandidate = await realpath(candidatePath);
+        const resolvedCandidate = await realpath(path);
         if (isWithinAllowedRoot(resolvedCandidate)) {
           return resolvedCandidate;
         }
@@ -1027,29 +1095,25 @@ async function resolveAllowedLocalPath(
       }
     }
 
-    if (resolvedRoots.length === 0) {
-      throw new Error(`Local media path is outside allowed roots: ${input}`);
-    }
-
-    const attemptedPath = resolvePath(resolvedRoots[0], normalizedInput);
-    const resolvedAttemptedPath = await realpath(attemptedPath);
+    const resolvedAttemptedPath = await realpath(candidates[0]!.path);
     if (!isWithinAllowedRoot(resolvedAttemptedPath)) {
-      throw new Error(`Local media path is outside allowed roots: ${input}`);
+      throw outside();
     }
     return resolvedAttemptedPath;
   }
 
-  const absolutePath = isAbsolute(normalizedInput)
-    ? normalizedInput
-    : resolvePath(normalizedInput);
-  const resolvedPath = await realpath(absolutePath);
-
-  if (!hasRootRestrictions) {
-    return resolvedPath;
+  // Lexical pre-check against the roots as configured and as canonicalized
+  // (`/tmp` vs `/private/tmp`); symlinks inside a root are settled by realpath.
+  const lexicalPath = resolvePath(normalizedInput);
+  const lexicalRoots = [...configuredRoots.map((root) => resolvePath(root)), ...resolvedRoots];
+  if (!lexicalRoots.some((root) => isPathWithin(root, lexicalPath))) {
+    throw outside();
   }
 
+  const resolvedPath = await realpath(normalizedInput);
+
   if (!isWithinAllowedRoot(resolvedPath)) {
-    throw new Error(`Local media path is outside allowed roots: ${input}`);
+    throw outside();
   }
 
   return resolvedPath;
@@ -1057,6 +1121,7 @@ async function resolveAllowedLocalPath(
 
 export async function loadVkOutboundMedia(params: {
   mediaUrl: string;
+  /** Local files require explicit, usable roots; HTTP and data URLs do not. */
   mediaLocalRoots?: readonly string[];
   forceDocument?: boolean;
   preferredName?: string;
