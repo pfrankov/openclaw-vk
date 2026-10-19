@@ -212,7 +212,9 @@ global.fetch = vi.fn().mockImplementation((_url, opts) => new Promise((_, reject
 ### Release and publish flow
 - Official release automation lives in `.github/workflows/publish-npm.yml`.
 - The workflow runs on pushed tags matching `v*`.
-- The pushed tag must match `package.json` version exactly (example: package version `2026.3.22` requires tag `v2026.3.22`).
+- The pushed tag must match `package.json` version exactly (example: package version `2026.10.20` requires tag `v2026.10.20`).
+- Versions follow `YEAR.MONTH.COUNTER` (for example `2026.11.1`, `2026.11.2`): year and month of the release, then a counter that starts at `1` for the first release of each month and increases by one per release. The last number is a release counter, not the day of the month. Exception: October 2026 continues from `2026.10.19`, so its next release is `2026.10.20`; the counter restarts at `2026.11.1`.
+- Do not add a hyphenated suffix (for example `2026.10.19-1`) for a second release: npm treats it as a prerelease and the workflow publishes it under the `beta` dist-tag instead of `latest`. Increase the counter instead.
 - On tag push the workflow runs `npm ci`, `npm test`, `npm pack --dry-run`, publishes to npm, and creates the GitHub Release.
 - Preferred operator flow:
   1. land changes on `main`
@@ -247,7 +249,7 @@ Error: Cannot find module 'zod'
 ## Changelog Maintenance
 
 - Keep `CHANGELOG.md` up to date for release-relevant changes. Changelog entries must be written in Russian.
-- Changelog format must be tag-based: each tag section summarizes changes from the previous tag to the current tag. Section heading is the tag name only (e.g. `## v2026.4.1`) — no separate date, since the version already encodes it.
+- Changelog format must be tag-based: each tag section summarizes changes from the previous tag to the current tag. Section heading is the tag name only (e.g. `## v2026.11.1`), with no separate date.
 - **UX-first principle:** every item leads with what the user sees or can do differently — not the mechanism behind it. Start from the observable effect, then add just enough context to locate the relevant setting if needed. Example: "Bold and italic text in agent replies now renders correctly in VK" — not "Added format_data conversion" or "Implemented VkFormatItem mapping". A good entry passes this test: would a user who only runs `openclaw` and chats via VK understand it without reading the code?
 - Changelog section headings must be in Russian: `Добавлено`, `Улучшено`, `Исправлено`, `Сопровождение`, `Для разработки`.
 - Before finalizing a release entry, compare the previous tag with current `HEAD` and ensure every **user-visible** change in that diff is reflected in the new section. Do not rely on memory.
