@@ -381,6 +381,31 @@ describe("sendMessageVk", () => {
     );
   });
 
+  it.each([
+    ["non-numeric", "current"],
+    ["blank", ""],
+    ["whitespace", "   "],
+    ["zero", "0"],
+    ["negative", "-5"],
+    ["fractional", "7.5"],
+    ["unsafe integer", "9007199254740993"],
+  ])("omits reply_to when replyTo is %s", async (_label, replyTo) => {
+    mockMessagesSend.mockResolvedValueOnce(5);
+
+    await sendMessageVk("123", "proactive", { cfg, replyTo });
+
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(getSendCall(0)).not.toHaveProperty("reply_to");
+  });
+
+  it("accepts a replyTo with surrounding whitespace", async () => {
+    mockMessagesSend.mockResolvedValueOnce(5);
+
+    await sendMessageVk("123", "reply", { cfg, replyTo: " 77 " });
+
+    expect(getSendCall(0)).toMatchObject({ reply_to: 77 });
+  });
+
   it("forwards keyboard when buttons are provided", async () => {
     mockMessagesSend.mockResolvedValueOnce(7);
 

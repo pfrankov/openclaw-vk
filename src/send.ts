@@ -898,6 +898,21 @@ async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string;
   };
 }
 
+/**
+ * VK's `reply_to` must be a positive message id. OpenClaw can hand us a reply
+ * target that is not one (e.g. a proactive `message` tool send), and passing it
+ * through as `NaN`/`0` makes VK reject the whole send with "reply_to not
+ * integer". Anything that is not a plain positive safe integer is dropped, so
+ * the message still goes out, just without a quote.
+ */
+function parseVkReplyTo(value: string | number | undefined | null): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = typeof value === "number" ? String(value) : value.trim();
+  if (!/^[0-9]+$/.test(raw)) return undefined;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
 async function sendVkApiMessage(params: {
   to: string;
   peerId: number;
@@ -912,6 +927,7 @@ async function sendVkApiMessage(params: {
     params.formatted.formatData && params.formatted.formatData.items.length > 0
       ? JSON.stringify(params.formatted.formatData)
       : undefined;
+  const replyTo = parseVkReplyTo(params.opts?.replyTo);
   const randomId = getRandomId();
   // Every message of every path goes out through here, so this is where a stop
   // is honoured per message: after an upload, between chunks, before a retry.
@@ -923,7 +939,7 @@ async function sendVkApiMessage(params: {
         random_id: randomId,
         ...(params.attachment ? { attachment: params.attachment } : {}),
         ...(keyboard ? { keyboard } : {}),
-        ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
+        ...(replyTo !== undefined ? { reply_to: replyTo } : {}),
         ...(formatData ? { format_data: formatData } : {}),
       });
     },
