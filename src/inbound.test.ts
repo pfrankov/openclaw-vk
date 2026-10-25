@@ -95,6 +95,8 @@ vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
+  formatLocationText: (location: { latitude: number; longitude: number }) => `📍 ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`,
+  toLocationContext: (location: { latitude: number; longitude: number }) => ({ LocationLat: location.latitude, LocationLon: location.longitude, LocationSource: "pin", LocationIsLive: false }),
   logInboundDrop: vi.fn(),
   toInboundMediaFacts: (media: Array<Record<string, unknown>> = [], defaults: Record<string, unknown> = {}) =>
     media.map((entry) => ({
@@ -3657,5 +3659,93 @@ describe("a core question in a group chat", () => {
     expect(
       findOpenVkQuestionDelivery({ questionId: QID, accountId: "default", peerId: GROUP_PEER_ID }),
     ).toBeDefined();
+  });
+});
+
+
+describe("native location inbound", () => {
+  it("dispatches a location-only message without turning coordinates into commands", async () => {
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({ text: "", location: { latitude: 55.75, longitude: 37.62 } }),
+      account: makeAccount({ config: { dmPolicy: "open" } }), config: baseCfg(), runtime: createVkRuntimeEnv(),
+    });
+    expect(getDispatchCall(runtime).ctx).toMatchObject({
+      BodyForAgent: "📍 55.750000, 37.620000", CommandBody: "", BodyForCommands: "",
+      LocationLat: 55.75, LocationLon: 37.62, LocationSource: "pin", LocationIsLive: false,
+    });
+  });
+});
+
+describe("location hydration admission", () => {
+  it("keeps pairing and avoids a lookup for an unpaired sender", async () => {
+    const runtime = installRuntime();
+    const loadLocation = vi.fn();
+    await handleVkInbound({
+      message: makeMessage({ text: "", hasLocation: true }), loadLocation,
+      account: makeAccount({ config: { dmPolicy: "pairing" } }), config: baseCfg(), runtime: createVkRuntimeEnv(),
+    });
+    expect(runtime.channel.pairing.upsertPairingRequest).toHaveBeenCalledOnce();
+    expect(loadLocation).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+  it("does not hydrate an unauthorized group control command", async () => {
+    const runtime = installRuntime({ hasControlCommand: true });
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth-native");
+    vi.mocked(resolveControlCommandGate).mockReturnValueOnce({ shouldBlock: true, commandAuthorized: false });
+    const loadLocation = vi.fn();
+    await handleVkInbound({
+      message: makeMessage({ text: "/status", hasLocation: true, isGroup: true, peerId: GROUP_PEER_ID, senderId: SENDER_ID }), loadLocation,
+      account: makeAccount({ config: { groupPolicy: "open", groupAllowFrom: [999] } }),
+      config: baseCfg({ groupPolicy: "open", groupAllowFrom: [999] }), runtime: createVkRuntimeEnv(),
+    });
+    expect(loadLocation).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+  it.each([
+    { config: { dmPolicy: "disabled" }, group: false },
+    { config: { dmPolicy: "allowlist", allowFrom: [999] }, group: false },
+    { config: { groupPolicy: "disabled" }, group: true },
+    { config: { groupPolicy: "open", groups: { "*": { requireMention: true } } }, group: true },
+  ])("does not look up location for rejected message: %j", async ({ config, group }) => {
+    const runtime = installRuntime();
+    const loadLocation = vi.fn().mockResolvedValue({ latitude: 1, longitude: 2 });
+    await handleVkInbound({
+      message: makeMessage({ text: "caption", hasLocation: true, isGroup: group,
+        peerId: group ? GROUP_PEER_ID : SENDER_ID, senderId: SENDER_ID }),
+      loadLocation, account: makeAccount({ config } as never), config: baseCfg(config), runtime: createVkRuntimeEnv(),
+    });
+    expect(loadLocation).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+  it.each(["", "caption"])("keeps original text %j when hydration has no usable coordinates", async (text) => {
+    const runtime = installRuntime();
+    const loadLocation = vi.fn().mockResolvedValue(undefined);
+    await handleVkInbound({
+      message: makeMessage({ text, hasLocation: true }), loadLocation,
+      account: makeAccount({ config: { dmPolicy: "open" } }), config: baseCfg(), runtime: createVkRuntimeEnv(),
+    });
+    expect(loadLocation).toHaveBeenCalledTimes(1);
+    if (text) expect(getDispatchCall(runtime).ctx).toMatchObject({ BodyForAgent: "caption", CommandBody: "caption" });
+    else expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+  it("keeps a location caption out of an open question's text answer path", async () => {
+    const runtime = installRuntime();
+    const questionId = `ask_${"8".repeat(32)}`;
+    const resolveOption = vi.fn().mockResolvedValue({ ok: true });
+    resetVkQuestionRuntimeForTest({ runtime: { resolveOption } as never });
+    rememberVkQuestionDelivery(questionId,
+      { accountId: "default", peerId: SENDER_ID, messageId: 91 },
+      { questionId, options: ["Here", "Elsewhere"], customInput: true });
+    try {
+      await handleVkInbound({
+        message: makeMessage({ peerId: SENDER_ID, senderId: SENDER_ID, text: "Here", hasLocation: true }),
+        loadLocation: vi.fn().mockResolvedValue(undefined),
+        account: makeAccount({ config: { dmPolicy: "open" } }), config: baseCfg(), runtime: createVkRuntimeEnv(),
+      });
+      expect(getDispatchCall(runtime).ctx).toMatchObject({ BodyForAgent: "Here" });
+      expect(resolveOption).not.toHaveBeenCalled();
+      expect(findOpenVkQuestionDelivery({ questionId, accountId: "default", peerId: SENDER_ID })).toBeDefined();
+    } finally { clearVkQuestionDeliveries(); resetVkQuestionRuntimeForTest(); }
   });
 });

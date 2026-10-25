@@ -9,9 +9,12 @@ import {
   type StatusReactionController,
 } from "openclaw/plugin-sdk/channel-feedback";
 import {
+  formatLocationText,
+  toLocationContext,
   logInboundDrop,
   toInboundMediaFacts,
   type ChannelInboundMediaInput,
+  type NormalizedLocation,
 } from "openclaw/plugin-sdk/channel-inbound";
 import {
   buildChannelProgressDraftLineForEntry,
@@ -186,6 +189,8 @@ async function deliverVkReply(params: {
 
 export async function handleVkInbound(params: {
   message: VkInboundMessage;
+  /** Exact-message location enrichment; never invoked before policy admission. */
+  loadLocation?: () => Promise<NormalizedLocation | undefined>;
   account: ResolvedVkAccount;
   config: CoreConfig;
   runtime: RuntimeEnv;
@@ -209,7 +214,7 @@ export async function handleVkInbound(params: {
     forwards: message.forwards,
   });
   const commandInput = payloadCommand ?? visibleBody;
-  if (!commandInput) {
+  if (!commandInput && !message.location && !message.hasLocation) {
     return;
   }
 
@@ -278,22 +283,6 @@ export async function handleVkInbound(params: {
   const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
   const firstForward = visibleForwards[0];
   const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(config as OpenClawConfig);
-  const rawBody =
-    payloadCommand ??
-    resolveVkInboundAgentText({
-      text: message.text,
-      attachments: message.attachments,
-      forwards: visibleForwards,
-      envelope: envelopeOptions,
-    });
-  if (!rawBody) {
-    // Only reachable when every forward was hidden: the empty-message check above
-    // already let this one through. Say so, without naming the hidden authors.
-    runtime.log?.(
-      `vk: drop group peerId=${redactVkId(message.peerId)} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
-    );
-    return;
-  }
 
   // Group access and sender authorization
   if (isGroup) {
@@ -398,6 +387,25 @@ export async function handleVkInbound(params: {
     return;
   }
 
+  const location = message.location ?? await params.loadLocation?.();
+  const agentText =
+    payloadCommand ??
+    resolveVkInboundAgentText({
+      text: message.text,
+      attachments: message.attachments,
+      forwards: visibleForwards,
+      envelope: envelopeOptions,
+    });
+  const rawBody = [agentText, location ? formatLocationText(location) : ""].filter(Boolean).join("\n");
+  if (!rawBody) {
+    if ((message.forwards?.length ?? 0) > 0 && visibleForwards.length === 0) {
+      runtime.log?.(
+        `vk: drop group peerId=${redactVkId(message.peerId)} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
+      );
+    }
+    return;
+  }
+
   // ── A typed answer to an open question from the core ─────────────────────
   // Taken here, before the core sees the message: while the run waits on the
   // question the session is busy and the core only queues new messages, so
@@ -413,6 +421,8 @@ export async function handleVkInbound(params: {
     plainText &&
     !message.isGroup &&
     !payloadCommand &&
+    !message.location &&
+    !message.hasLocation &&
     !isAbortRequestText(plainText) &&
     !core.channel.text.hasControlCommand(plainText, config as OpenClawConfig) &&
     (message.attachments?.length ?? 0) === 0 &&
@@ -525,6 +535,7 @@ export async function handleVkInbound(params: {
     OriginatingTo: `vk:${peerId}`,
     CommandAuthorized: commandGate.commandAuthorized,
     media: media.length > 0 ? media : undefined,
+    ...(location ? toLocationContext(location) : {}),
     ...(isQuoteVisible && {
       ReplyToId: message.replyToMessageId,
       ReplyToIdFull: message.replyToMessageId,
