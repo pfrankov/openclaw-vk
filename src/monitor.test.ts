@@ -591,12 +591,57 @@ describe("message_event handler", () => {
 // ── message_new handler ───────────────────────────────────────────────────────
 
 describe("message_new handler", () => {
+  it("preserves the received message while hydrating only its native location", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+    const ctx = makeCtx({ hasGeo: true, conversationMessageId: 8,
+      text: "/status", messagePayload: { oc: "/status" },
+      attachments: [{ type: "photo", largeSizeUrl: "https://example.com/original.png" }],
+      replyMessage: { id: 7, text: "original quote" },
+      forwards: [{ senderId: 999, text: "original forward", attachments: [] }],
+    });
+    const load = vi.fn(async () => {
+      Object.assign(ctx, { id: 999, senderId: 999, conversationMessageId: 99,
+        text: "later edit", messagePayload: undefined, attachments: [], replyMessage: undefined,
+        forwards: [], geo: { coordinates: { latitude: 55.75, longitude: 37.62 } } });
+    });
+    ctx.loadMessagePayload = load;
+    await getMessageHandler()(ctx);
+    const { message, loadLocation } = mockHandleVkInbound.mock.calls[0][0];
+    expect(load).not.toHaveBeenCalled();
+    expect(await loadLocation()).toEqual({ latitude: 55.75, longitude: 37.62 });
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(message).toMatchObject({ messageId: "42", senderId: 555_000,
+      conversationMessageId: 8, text: "/status", messagePayload: { oc: "/status" },
+      hasLocation: true,
+      attachments: [{ url: "https://example.com/original.png" }],
+      replyToMessageId: "7", replyToText: "original quote",
+      forwards: [{ text: "original forward" }],
+    });
+  });
+
   it("registers a message_new event handler", async () => {
     activeMonitor = startMonitor();
     await flush();
 
     const events = mockUpdatesOn.mock.calls.map(([event]) => event);
     expect(events).toContain("message_new");
+  });
+
+  it("keeps ID-only media unchanged and does not inject a late attachment", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+    const ctx = makeCtx({ hasGeo: true, attachments: [{ type: "photo", id: 12, ownerId: 34 }] });
+    ctx.loadMessagePayload = vi.fn(async () => {
+      Object.assign(ctx, { geo: { coordinates: { latitude: 1, longitude: 2 } },
+        attachments: [{ type: "photo", id: 99, ownerId: 34, largeSizeUrl: "https://example.com/late.png" }] });
+    });
+    await getMessageHandler()(ctx);
+    const { message, loadLocation } = mockHandleVkInbound.mock.calls[0][0];
+    const before = structuredClone(message);
+    expect(await loadLocation()).toEqual({ latitude: 1, longitude: 2 });
+    expect(message).toEqual(before);
+    expect(message.attachments).toEqual([{ type: "photo", kind: "image", url: undefined, title: undefined, mimeType: "image/jpeg" }]);
   });
 
   it("calls handleVkInbound with correct payload on incoming message", async () => {

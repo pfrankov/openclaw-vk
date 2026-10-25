@@ -7,6 +7,7 @@ import { PollingTransport, VK } from "vk-io";
 import { createStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { resolveVkAccount } from "./accounts.js";
 import { redactVkId } from "./diagnostics.js";
+import { canLoadVkLocation, normalizeVkLocation, resolveVkInboundLocation } from "./location.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
@@ -352,6 +353,14 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       replyToForwards: replyContext.replyToForwards,
     };
 
+    message.location = normalizeVkLocation(context.geo);
+    message.hasLocation = context.hasGeo;
+    // Hydration must not replace original facts with a later edit. The inbound
+    // policy gates decide whether to invoke this exact-message lookup.
+    const loadLocation = !message.location && canLoadVkLocation(context)
+      ? () => resolveVkInboundLocation(context)
+      : undefined;
+
     core.channel.activity.record({
       channel: "vk",
       accountId: account.accountId,
@@ -369,6 +378,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
       await handleVkInbound({
         message,
+        loadLocation,
         account: currentAccount,
         config: currentCfg,
         runtime: opts.runtime,

@@ -1,3 +1,5 @@
+import type { NormalizedLocation } from "openclaw/plugin-sdk/channel-inbound";
+
 /** Channel diagnostic levels. Parsing and redaction live in src/diagnostics.ts. */
 export const VK_DIAG_LEVELS = ["off", "redacted", "full"] as const;
 export type VkDiagLevel = (typeof VK_DIAG_LEVELS)[number];
@@ -88,6 +90,9 @@ export type VkInboundMessage = {
   timestamp: number;
   isGroup: boolean;
   messagePayload?: unknown;
+  location?: NormalizedLocation;
+  /** A native location was attached, even if its coordinates are not yet available. */
+  hasLocation?: boolean;
   attachments?: VkInboundAttachment[];
   replyToMessageId?: string;
   replyToText?: string;
