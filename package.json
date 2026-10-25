@@ -84,7 +84,7 @@
   "dependencies": {
     "markdown-to-vk": "^0.3.2",
     "vk-io": "^4.10.1",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "openclaw": ">=2026.8.1-0"
